@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,12 +8,13 @@ version = "0.1.0"
 description = "Transparent Google Python Fire wrapper with conventional help syntax"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-    {name = "Christiane Ruetten (cr@23bit.net)"}
+    {name = "Christiane Ruetten", email = "cr@23bit.net"}
 ]
 dependencies = [
-    "fire>=0.7"
+    "fire>=0.2.0"
 ]
 
 [project.urls]
