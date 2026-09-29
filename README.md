@@ -80,6 +80,19 @@ fireaid does not take anything away from the wrapped program:
   as a member created in `__init__`, may have such a parameter. There,
   `-h` is left to Fire, which shows help with its banner on stderr.
 
+Help for a command that does not exist is an error, as it is in
+Fire's native syntax.
+
 As with Fire, help is shown for what the command line evaluates to.
 `tool foo x --help` calls `foo` and shows help for its result. Ask
 for `tool foo --help` to get help for `foo`.
+
+## Tests
+
+    make test
+
+creates a virtual environment in `.venv`, upgrades it to the latest
+stable Fire, and runs the test suite. The tests hold fireaid to what
+this README says, mostly by comparing it to Fire on the same command
+lines. `make test PYTHON=python3.14` selects the Python for a new
+environment, `make clean` removes it.

@@ -17,9 +17,17 @@ dependencies = [
     "fire>=0.2.0"
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest"
+]
+
 [project.urls]
 Homepage = "https://github.com/cr/fireaid"
 Repository = "https://github.com/cr/fireaid"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
