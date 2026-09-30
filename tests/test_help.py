@@ -123,3 +123,19 @@ def test_fire_calls_an_incomplete_command_a_success(run):
     result = run("static", module="fire")
     assert result.code == 0
     assert result.out.startswith("NAME")
+
+
+def test_instantiated_class_is_an_incomplete_command(run):
+    result = run("CLI", component="NONE")
+    assert result.code == 2
+    assert result.out.startswith("Usage: cli.py CLI <")
+
+
+@pytest.mark.parametrize("component, command", [("make", ""), ("NONE", "make")])
+def test_returned_object_is_not_an_incomplete_command(run, component, command):
+    # A function ran. Fire shows help for what came back.
+    result = run(command, component=component)
+    assert result.code == 0
+    assert result.err == ""
+    assert result.out.startswith("NAME")
+    assert result == run(command, module="fire", component=component)

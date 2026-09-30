@@ -14,7 +14,7 @@ TESTS = Path(__file__).parent
 PAGER = "sed s/^/PAGED:/"
 
 
-def run_on_terminal(command, module="fireaid", code=0):
+def run_on_terminal(command, module="fireaid", code=0, component="CLI"):
     """Run the test program with a terminal as stdin, stdout and stderr."""
     master, slave = pty.openpty()
     try:
@@ -23,7 +23,12 @@ def run_on_terminal(command, module="fireaid", code=0):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=dict(os.environ, FIREAID_TEST_MODULE=module, PAGER=PAGER),
+            env=dict(
+                os.environ,
+                FIREAID_TEST_MODULE=module,
+                FIREAID_TEST_COMPONENT=component,
+                PAGER=PAGER,
+            ),
             cwd=TESTS,
         )
     finally:
@@ -69,3 +74,10 @@ def test_group_is_not_paged():
         output = run_on_terminal(command, code=2)
         assert output.startswith("Usage: cli.py")
         assert "PAGED" not in output
+
+
+def test_returned_object_is_not_paged():
+    assert "PAGED:" in run_on_terminal("", "fire", component="make")
+    output = run_on_terminal("", component="make")
+    assert "\n    cli.py\n" in output
+    assert "PAGED" not in output

@@ -65,6 +65,11 @@ def fn(word, help=False):
     return f"fn word={word!r} help={help}"
 
 
+def make():
+    """Make doc."""
+    return Sub()
+
+
 DICT = {"foo": CLI().foo, "help": lambda: "own help"}
 
 

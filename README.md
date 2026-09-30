@@ -1,10 +1,11 @@
 # fireaid
 
 `fireaid` is a thin, transparent wrapper around
-[Google Python Fire](https://github.com/google/python-fire).
-
-It rounds off Fire's command-line help syntax while otherwise delegating
-to Python Fire.
+[Google Python Fire](https://github.com/google/python-fire). It adds the
+`help` subcommand that works just like you would expect from tools like
+`git` or `npm`. Help text also goes to *stdout* and is no longer forced
+through the pager. Running the plain command will no longer just page
+the help, but show usage info and raise an error.
 
 ## Installation
 
@@ -61,11 +62,34 @@ fireaid additionally supports Git-style help:
 With `--help` and `-h`, fireaid also
 
 - prints the help text to stdout, so that `tool --help | less` works,
+- prints it as it is, where Fire starts a pager on a terminal,
 - omits Fire's `INFO: Showing help with the command ...` banner,
 - shows help for functions taking `**kwargs`, where Fire passes
   `help=True` to the function.
 
-Native Fire syntax continues to work unchanged, printing to stderr.
+Native Fire syntax continues to work unchanged, printing to stderr,
+or to a pager on a terminal.
+
+## Usage text
+
+A command line that names a group rather than a command, such as
+plain `tool`, is a success to Fire, which shows the full help for the
+group, in a pager. To fireaid it is an incomplete command, as it is to
+Git: it prints Fire's short usage text to stdout, and exits with 2,
+Fire's exit code for errors:
+
+    Usage: tool <group|command>
+      available groups:      shelf
+      available commands:    add | list | remove | search
+
+    For detailed information on this command, run:
+      tool --help
+
+A function that returns an object is a complete command. There, Fire
+shows the help for the object, which fireaid only keeps from the pager.
+
+`examples/pantry.py` is a small program to try all of this on, and
+`examples/tour.sh` runs through it.
 
 ## Limits
 

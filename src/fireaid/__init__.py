@@ -32,7 +32,10 @@ fireaid additionally accepts Git-style help:
     tool help foo bar
 
 and makes ``--help`` and ``-h`` print the help text to stdout, without
-Fire's INFO banner, including for functions that take ``**kwargs``.
+Fire's INFO banner or pager, including for functions that take ``**kwargs``.
+
+An incomplete command, such as plain ``tool``, prints Fire's usage text
+and exits with an error, where Fire shows the full help as a success.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ import fire as _fire
 __all__ = ["Fire"]
 
 _HELP = ["--", "--help"]
+_NOT_CALLED = ("Initial component", "Instantiated class", "Accessed property")
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 
 
@@ -160,12 +164,65 @@ def _normalize_help(argv: Sequence[str], component: Any) -> list[str]:
 
 def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
     """
-    Stand in for fire.core.Display, printing to stdout instead of stderr.
+    Stand in for fire.core.Display, printing to stdout instead of stderr,
+    and not through a pager.
     """
-    _display(lines, out=sys.stdout)
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+def _display_unpaged(lines: Sequence[str], out: Any) -> None:
+    """
+    Stand in for fire.core.Display, paging only what Fire sends to stderr.
+
+    What Fire sends to stdout is the text for a command line that names
+    a group rather than a command. Its native help goes to stderr.
+    """
+    if out is sys.stdout:
+        _display_stdout(lines)
+    else:
+        _display(lines, out=out)
+
+
+def _called(trace: Any) -> bool:
+    """
+    Tell whether the last step of a Fire trace was a function call.
+
+    If the trace does not say, assume so, which leaves things to Fire.
+    """
+    try:
+        action = trace.elements[-1]._action
+    except (AttributeError, IndexError):
+        return True
+    return action not in _NOT_CALLED
+
+
+class _HelpText:
+    """
+    Stand in for the fire.helptext module, as fire.core sees it.
+
+    Fire prints the full help for a command line that names a group
+    rather than a command, and calls it a success. This makes it the
+    usage text, and keeps the trace, for the caller to call it an error.
+
+    Fire prints the same for an object returned by a function. That is
+    left alone: the command was complete.
+    """
+
+    def __init__(self) -> None:
+        self.incomplete = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_helptext, name)
+
+    def HelpText(self, component: Any, trace: Any = None, verbose: bool = False) -> str:
+        if trace is None or trace.show_help or trace.HasError() or _called(trace):
+            return _helptext.HelpText(component, trace=trace, verbose=verbose)
+        self.incomplete = trace
+        return _helptext.UsageText(component, trace=trace, verbose=verbose)
 
 
 _display = getattr(_fire.core, "Display", None)
+_helptext = getattr(_fire.core, "helptext", None)
 
 # Obtain the signature from the installed Fire version instead of
 # duplicating it here. This makes fireaid less dependent on Fire's
@@ -205,15 +262,26 @@ def Fire(*args: Any, **kwargs: Any) -> Any:
 
     arguments["command"] = _normalize_help(command, arguments["component"])
 
-    if arguments["command"] == list(command) or _display is None:
+    if _display is None or _helptext is None:
         return _fire.Fire(*bound.args, **bound.kwargs)
 
-    # Help was asked for in conventional syntax, so it belongs on stdout.
-    _fire.core.Display = _display_stdout
+    helptext = _HelpText()
+    _fire.core.helptext = helptext
+    if arguments["command"] == list(command):
+        _fire.core.Display = _display_unpaged
+    else:
+        # Help was asked for in conventional syntax, so it belongs on stdout.
+        _fire.core.Display = _display_stdout
     try:
-        return _fire.Fire(*bound.args, **bound.kwargs)
+        result = _fire.Fire(*bound.args, **bound.kwargs)
     finally:
         _fire.core.Display = _display
+        _fire.core.helptext = _helptext
+
+    if helptext.incomplete is not None:
+        # Fire has printed the usage in place of a result.
+        raise _fire.core.FireExit(2, helptext.incomplete)
+    return result
 
 
 # Make introspection of fireaid.Fire look like fire.Fire rather than
