@@ -64,7 +64,6 @@ def test_command_runs_as_with_fire(run, component, command, out):
         # Errors.
         ("CLI", "nonesuch"),
         ("CLI", "foo"),
-        ("CLI", ""),
     ],
 )
 def test_output_is_fires(run, component, command):

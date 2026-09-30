@@ -118,14 +118,25 @@ def test_invalid_argument_is_an_error():
         fireaid.Fire(Program, nonesuch=1)
 
 
-def test_fire_is_left_as_found(capsys):
-    display = fire.core.Display
-    with pytest.raises(fire.core.FireExit):
-        fireaid.Fire(Program, command="--help")
+def test_incomplete_command_argument(capsys):
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Program, command=[], name="tool")
+    assert exit.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith("Usage: tool <command>")
+
+
+@pytest.mark.parametrize("command", ["foo", "", "--help", "nonesuch --help"])
+def test_fire_is_left_as_found(command, capsys):
+    display, helptext = fire.core.Display, fire.core.helptext
+    assert helptext is fire.helptext
+    try:
+        fireaid.Fire(Program, command=command)
+    except fire.core.FireExit:
+        pass
     assert fire.core.Display is display
-    with pytest.raises(fire.core.FireExit):
-        fireaid.Fire(Program, command="nonesuch --help")
-    assert fire.core.Display is display
+    assert fire.core.helptext is helptext
 
 
 def test_run_as_module(run_module):

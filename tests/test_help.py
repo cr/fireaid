@@ -104,3 +104,22 @@ def test_fire_prints_banner_to_stderr(run):
     assert result.code == 0
     assert result.out == ""
     assert result.err.startswith(BANNER)
+
+
+@pytest.mark.parametrize("command", ["", "static", "dynamic"])
+def test_incomplete_command_is_an_error_with_usage(run, command):
+    result = run(command)
+    assert result.code == 2
+    assert result.err == ""
+    assert result.out.startswith(f"Usage: cli.py {command}".rstrip() + " <")
+    # The usage is the one Fire prints for an error at the same place.
+    error, usage = run(f"{command} nonesuch", module="fire").err.split("\n", 1)
+    assert error.startswith("ERROR")
+    assert result.out == usage
+
+
+def test_fire_calls_an_incomplete_command_a_success(run):
+    # The premise.
+    result = run("static", module="fire")
+    assert result.code == 0
+    assert result.out.startswith("NAME")
