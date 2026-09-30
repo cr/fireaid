@@ -3,6 +3,8 @@ The program under test. Not a test module itself.
 
 FIREAID_TEST_MODULE selects fire or fireaid, FIREAID_TEST_COMPONENT the
 component passed to Fire(), NONE standing for no component at all.
+FIREAID_TEST_HELP gives the component fireaid's help command up front,
+to see what Fire makes of it as a command like any other.
 """
 
 import os
@@ -72,10 +74,17 @@ def make():
 
 DICT = {"foo": CLI().foo, "help": lambda: "own help"}
 
+INSTANCE = CLI()
+
 
 if __name__ == "__main__":
     which = os.environ.get("FIREAID_TEST_COMPONENT", "CLI")
     if which == "NONE":
         fire.Fire()
     else:
-        fire.Fire(globals()[which])
+        component = globals()[which]
+        if os.environ.get("FIREAID_TEST_HELP"):
+            import fireaid
+
+            component, _ = fireaid._add_help(component)
+        fire.Fire(component)

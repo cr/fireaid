@@ -52,6 +52,7 @@ import fire as _fire
 __all__ = ["Fire"]
 
 _HELP = ["--", "--help"]
+_FLAGS = ("-h", "--help")
 _NOT_CALLED = ("Initial component", "Instantiated class", "Accessed property")
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 
@@ -111,7 +112,7 @@ def _accepts(target: Any, flag: str) -> bool:
     return any(name.startswith("h") for name in names)
 
 
-def _normalize_help(argv: Sequence[str], component: Any) -> list[str]:
+def _normalize_help(argv: Sequence[str], component: Any, ours: bool) -> list[str]:
     """
     Translate conventional help syntax into Python Fire's native syntax.
 
@@ -135,8 +136,9 @@ def _normalize_help(argv: Sequence[str], component: Any) -> list[str]:
     If an explicit ``--`` separator is already present, the command is
     assumed to use native Fire syntax and is left untouched.
 
-    ``help`` is only interpreted as the first word, and only if the
-    component is not a function and has no ``help`` member of its own.
+    ``help`` is only interpreted as the first word, and only if it is
+    ``ours``: the component is not a function and has no ``help`` member
+    of its own. ``help --help`` is help for the help command itself.
 
     ``-h`` and ``--help`` are only interpreted as the last word, and
     only if the command they follow does not take them as an argument.
@@ -147,19 +149,73 @@ def _normalize_help(argv: Sequence[str], component: Any) -> list[str]:
     if not argv or "--" in argv:
         return argv
 
-    if argv[0] == "help":
-        if inspect.isroutine(component) or _member(component, "help")[0]:
-            return argv
-        return argv[1:] + _HELP
-
     flag = argv[-1]
-    if flag not in ("-h", "--help"):
+
+    if argv[0] == "help" and ours:
+        if flag not in _FLAGS:
+            return argv[1:] + _HELP
+        if len(argv) > 2 or not _member(component, "help")[0]:
+            return argv[1:-1] + _HELP
+
+    if flag not in _FLAGS:
         return argv
 
     target, known = _resolve(component, argv[:-1])
     if _accepts(target, flag) or (flag == "-h" and not known):
         return argv
     return argv[:-1] + _HELP
+
+
+def _help_command(component: Any, name: Any) -> tuple[Any, Any]:
+    """
+    Make the help command of a component, as a function and as a method.
+
+    Command lines starting with ``help`` are translated before Fire sees
+    them, so this is mostly there for Fire to list with the component's
+    other commands. It is what runs if Fire is given the command in its
+    native syntax.
+    """
+
+    def help(*command):
+        """Show help for the program, or for a command.
+
+        Args:
+            command: The command to show help for, as it would be run.
+        """
+        words = [str(word) for word in command]
+        return _fire_with(_display_stdout, component, command=words + _HELP, name=name)
+
+    def method(self, *command):
+        return help(*command)
+
+    method.__name__ = help.__name__
+    method.__doc__ = help.__doc__
+    return help, method
+
+
+def _add_help(component: Any, name: Any = None) -> tuple[Any, Any]:
+    """
+    Give a component a help command.
+
+    Returns the component to pass to Fire, and a function to undo it.
+    A dict gets a copy with the command added. A module gets it as an
+    attribute, and anything else as a method of its class, for as long
+    as Fire runs. A component that cannot take one is returned as it is.
+    """
+    help, method = _help_command(component, name)
+    if isinstance(component, dict):
+        return dict(component, help=help), None
+    if inspect.ismodule(component):
+        owner, member = component, help
+    elif inspect.isclass(component):
+        owner, member = component, method
+    else:
+        owner, member = type(component), method
+    try:
+        setattr(owner, "help", member)
+    except (AttributeError, TypeError):
+        return component, None
+    return component, lambda: delattr(owner, "help")
 
 
 def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
@@ -260,20 +316,37 @@ def Fire(*args: Any, **kwargs: Any) -> Any:
         # Not a valid command. Let Fire report it.
         return _fire.Fire(*bound.args, **bound.kwargs)
 
-    arguments["command"] = _normalize_help(command, arguments["component"])
+    component = arguments["component"]
+    ours = not (inspect.isroutine(component) or _member(component, "help")[0])
+    undo = None
+    if ours:
+        arguments["component"], undo = _add_help(component, arguments.get("name"))
 
+    try:
+        arguments["command"] = _normalize_help(command, arguments["component"], ours)
+        if arguments["command"] == list(command):
+            display = _display_unpaged
+        else:
+            # Help was asked for in conventional syntax: it belongs on stdout.
+            display = _display_stdout
+        return _fire_with(display, *bound.args, **bound.kwargs)
+    finally:
+        if undo is not None:
+            undo()
+
+
+def _fire_with(display: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Call fire.Fire() with a stand-in for its display of help.
+    """
     if _display is None or _helptext is None:
-        return _fire.Fire(*bound.args, **bound.kwargs)
+        return _fire.Fire(*args, **kwargs)
 
     helptext = _HelpText()
     _fire.core.helptext = helptext
-    if arguments["command"] == list(command):
-        _fire.core.Display = _display_unpaged
-    else:
-        # Help was asked for in conventional syntax, so it belongs on stdout.
-        _fire.core.Display = _display_stdout
+    _fire.core.Display = display
     try:
-        result = _fire.Fire(*bound.args, **bound.kwargs)
+        result = _fire.Fire(*args, **kwargs)
     finally:
         _fire.core.Display = _display
         _fire.core.helptext = _helptext

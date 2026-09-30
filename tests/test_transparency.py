@@ -67,8 +67,9 @@ def test_command_runs_as_with_fire(run, component, command, out):
     ],
 )
 def test_output_is_fires(run, component, command):
+    # Fire's own output lists the commands, the help command among them.
     result = run(command, component=component)
-    assert result == run(command, module="fire", component=component)
+    assert result == run(command, module="fire", component=component, help=True)
 
 
 def test_native_help_is_on_stderr(run):

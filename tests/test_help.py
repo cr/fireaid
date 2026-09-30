@@ -94,7 +94,7 @@ def test_help_for_an_unknown_command_is_an_error(run, command):
     result = run(command)
     assert result.code == 2
     assert result.out == ""
-    assert result == run("nonesuch -- --help", module="fire")
+    assert result == run("nonesuch -- --help", module="fire", help=True)
     assert result.err.startswith("ERROR: Could not consume arg: nonesuch")
 
 
@@ -113,7 +113,8 @@ def test_incomplete_command_is_an_error_with_usage(run, command):
     assert result.err == ""
     assert result.out.startswith(f"Usage: cli.py {command}".rstrip() + " <")
     # The usage is the one Fire prints for an error at the same place.
-    error, usage = run(f"{command} nonesuch", module="fire").err.split("\n", 1)
+    fires = run(f"{command} nonesuch", module="fire", help=True)
+    error, usage = fires.err.split("\n", 1)
     assert error.startswith("ERROR")
     assert result.out == usage
 
@@ -139,3 +140,52 @@ def test_returned_object_is_not_an_incomplete_command(run, component, command):
     assert result.err == ""
     assert result.out.startswith("NAME")
     assert result == run(command, module="fire", component=component)
+
+
+HELP_ENTRY = "\n     help\n       Show help for the program, or for a command.\n"
+
+
+def test_help_command_is_listed_in_usage(run):
+    for component in ("CLI", "INSTANCE", "NONE"):
+        commands = [
+            line for line in run("", component=component).out.splitlines()
+            if line.startswith("  available commands:")
+        ]
+        assert len(commands) == 1
+        assert " help " in commands[0] + " "
+
+
+def test_help_command_is_listed_in_help(run):
+    for command in ("--help", "-h", "help"):
+        result = run(command, component="INSTANCE")
+        assert result.code == 0
+        assert HELP_ENTRY in result.out
+        fires = run("-- --help", module="fire", component="INSTANCE", help=True)
+        assert result.out == fires.err
+
+
+def test_help_command_is_not_listed_below_the_top(run):
+    assert "help" not in run("static").out.split("For detailed")[0]
+    assert HELP_ENTRY not in run("static --help").out
+
+
+@pytest.mark.parametrize("command", ["help --help", "help -h", "help help"])
+def test_help_for_the_help_command(run, command):
+    result = run(command)
+    assert result.code == 0
+    assert result.err == ""
+    assert "cli.py help - Show help for the program, or for a command." in result.out
+    assert "cli.py help [COMMAND]..." in result.out
+
+
+@pytest.mark.parametrize("command", ["help foo --help", "help foo -h"])
+def test_help_with_a_help_flag(run, command):
+    assert run(command) == run("help foo")
+
+
+@pytest.mark.parametrize("component", ["WithHelp", "DICT", "fn"])
+def test_no_help_command_where_it_is_not_ours(run, component):
+    # The program's own help command, or a single function: all is Fire's.
+    for command in ("nonesuch", "help -- --help"):
+        result = run(command, component=component)
+        assert result == run(command, module="fire", component=component)

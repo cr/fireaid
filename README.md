@@ -59,6 +59,12 @@ fireaid additionally supports Git-style help:
     tool help foo
     tool help foo bar
 
+`help` is a command like any other: Fire lists it with the program's
+commands in the usage text and in the help, and `tool help help` shows
+help for it.
+To that end, fireaid adds the command to the program for as long as
+Fire runs: to its class, or to a copy if the program is a dict.
+
 With `--help` and `-h`, fireaid also
 
 - prints the help text to stdout, so that `tool --help | less` works,
@@ -80,7 +86,7 @@ Fire's exit code for errors:
 
     Usage: tool <group|command>
       available groups:      shelf
-      available commands:    add | list | remove | search
+      available commands:    add | help | list | remove | search
 
     For detailed information on this command, run:
       tool --help

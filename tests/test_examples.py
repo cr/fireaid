@@ -22,6 +22,8 @@ def test_tour():
     out = completed.stdout
     assert "Usage: pantry.py <group|command>\n" in out
     assert "(exit code 2)" in out
+    assert "  available commands:    add | help | list | remove | search\n" in out
+    assert "pantry.py help - Show help for the program, or for a command." in out
     assert "Usage: pantry.py shelf <command>\n" in out
     assert out.count("pantry.py - Keep track of what is in the pantry.") == 3
     assert out.count("pantry.py add - Put an item into the pantry.") == 3

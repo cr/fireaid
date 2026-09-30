@@ -166,3 +166,39 @@ def test_run_as_module_without_a_module(run_module):
     result = run_module("")
     assert result.code == 1
     assert result.out.startswith("usage: python -m fireaid")
+
+
+def test_help_command_in_native_syntax(capsys):
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Program, command="help foo -- --verbose", name="tool")
+    assert exit.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "tool foo - Foo doc." in captured.out
+
+
+@pytest.mark.parametrize("command", ["foo", "", "help", "help help", "nonesuch"])
+def test_component_is_left_as_found(command, capsys):
+    import types
+
+    module = types.ModuleType("module")
+    module.foo = Program().foo
+    instance = Program()
+    mapping = {"foo": instance.foo}
+    for component in (Program, instance, module, mapping):
+        try:
+            fireaid.Fire(component, command=command)
+        except fire.core.FireExit:
+            pass
+    assert not hasattr(Program, "help")
+    assert not hasattr(module, "help")
+    assert vars(instance) == {}
+    assert list(mapping) == ["foo"]
+
+
+def test_component_that_cannot_take_a_help_command(capsys):
+    # A list has no commands of its own, and its class is not ours to touch.
+    assert fireaid.Fire([1, 2], command="1") == 2
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire([1, 2], command="help")
+    assert exit.value.code == 0

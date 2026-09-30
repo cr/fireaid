@@ -29,6 +29,10 @@ demo add --help
 demo help add
 
 echo
+echo '### help is a command like any other, with help of its own'
+demo help help
+
+echo
 echo '### Help for a group and a command within it'
 demo shelf -h
 demo help shelf label

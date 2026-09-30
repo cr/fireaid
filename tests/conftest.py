@@ -26,11 +26,12 @@ class Result:
         return f"Result(code={self.code!r}, out={self.out!r}, err={self.err!r})"
 
 
-def _run(argv, module="fireaid", component="CLI"):
+def _run(argv, module="fireaid", component="CLI", help=False):
     env = dict(
         os.environ,
         FIREAID_TEST_MODULE=module,
         FIREAID_TEST_COMPONENT=component,
+        FIREAID_TEST_HELP="1" if help else "",
         PAGER="cat",
         COLUMNS="80",
     )
@@ -48,10 +49,14 @@ def _run(argv, module="fireaid", component="CLI"):
 
 @pytest.fixture
 def run():
-    """Run the test program on a command line, with fireaid or with fire."""
+    """
+    Run the test program on a command line, with fireaid or with fire.
 
-    def run(command, module="fireaid", component="CLI"):
-        return _run(["cli.py", *command.split()], module, component)
+    With help, Fire is given a component that has fireaid's help command.
+    """
+
+    def run(command, module="fireaid", component="CLI", help=False):
+        return _run(["cli.py", *command.split()], module, component, help)
 
     return run
 
