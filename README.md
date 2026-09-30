@@ -136,3 +136,13 @@ stable Fire, and runs the test suite. The tests hold fireaid to what
 this README says, mostly by comparing it to Fire on the same command
 lines. `make test PYTHON=python3.14` selects the Python for a new
 environment, `make clean` removes it.
+
+## Releasing
+
+Set the new `version` in `pyproject.toml`, commit, then tag and push:
+
+    git tag v0.1.0 && git push origin main v0.1.0
+
+The tag starts `.github/workflows/publish.yml`, which runs the tests,
+checks that the tag is the package version, builds, and publishes to
+PyPI as a trusted publisher. PyPI never takes the same version twice.
