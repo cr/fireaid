@@ -36,11 +36,15 @@ Fire's INFO banner or pager, including for functions that take ``**kwargs``.
 
 An incomplete command, such as plain ``tool``, prints Fire's usage text
 and exits with an error, where Fire shows the full help as a success.
+
+On a terminal, usage text and help are coloured.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
+import re
 import shlex
 import sys
 from collections.abc import Sequence
@@ -218,6 +222,123 @@ def _add_help(component: Any, name: Any = None) -> tuple[Any, Any]:
     return component, lambda: delattr(owner, "help")
 
 
+# What colours what, as the parameters of an ANSI escape sequence.
+# Headings are bold light blue, labels within the text light blue, the
+# names of commands and flags light green, placeholders yellow.
+_HEADING = "1;94"
+_LABEL = "94"
+_NAME = "92"
+_PLACEHOLDER = "33"
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_FLAG_LINE = re.compile(r"^(    )((?:-\w, )?--[\w-]+)", re.MULTILINE)
+_NAME_LINE = re.compile(r"^(     )(\S+)$")
+_USAGE_ITEMS = re.compile(r"^(  )([a-z ]+:)( +)(.*)$")
+_USAGE_ITEM = re.compile(r"[^\s|]+")
+_USAGE_MORE = re.compile(r"^( {20,})(.*)$")
+
+
+def _paint(style: str, text: str) -> str:
+    return f"\x1b[{style}m{text}\x1b[0m"
+
+
+def _heading(text: str) -> str:
+    # Fire also marks some placeholders as bold. They have their colour.
+    return text if "\x1b[" in text else _paint(_HEADING, text)
+
+
+def _placeholder(text: str) -> str:
+    return _paint(_PLACEHOLDER, text)
+
+
+def _use_color() -> bool:
+    """
+    Tell whether help and usage are to be coloured.
+
+    They are on a terminal that has colours, that is if neither stdout
+    nor stderr is redirected, and the terminal's description says so.
+    NO_COLOR switches colour off, FORCE_COLOR on.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    try:
+        if not (sys.stdout.isatty() and sys.stderr.isatty()):
+            return False
+    except (AttributeError, ValueError):
+        return False
+    return _terminal_has_colors()
+
+
+def _terminal_has_colors() -> bool:
+    """
+    Tell whether the terminal named by TERM has colours.
+
+    The terminfo database knows, where there is one. A terminal it does
+    not know is taken to be a new one rather than an old one. Windows
+    has neither TERM nor terminfo, and a console that has colours.
+    """
+    term = os.environ.get("TERM")
+    if os.name == "nt":
+        return term != "dumb"
+    if not term or term == "dumb":
+        return False
+    try:
+        import curses
+
+        curses.setupterm(term=term, fd=sys.stdout.fileno())
+        return curses.tigetnum("colors") >= 8
+    except Exception:
+        return True
+
+
+def _color_help(text: str) -> str:
+    """
+    Colour what Fire does not mark in its help text: the names of flags,
+    and the names in the lists of commands, groups and values.
+
+    Headings and placeholders are marked by Fire, and coloured by the
+    stand-ins for its Bold and Underline.
+    """
+    lines = []
+    section = ""
+    for line in text.split("\n"):
+        if line and not line.startswith(" "):
+            section = _ANSI.sub("", line)
+        elif section == "FLAGS":
+            line = _FLAG_LINE.sub(lambda m: m.group(1) + _paint(_NAME, m.group(2)), line)
+        elif section in ("COMMANDS", "GROUPS", "VALUES", "INDEXES"):
+            line = _NAME_LINE.sub(lambda m: m.group(1) + _paint(_NAME, m.group(2)), line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _color_usage(text: str) -> str:
+    """
+    Colour Fire's usage text, which comes without any marks.
+    """
+
+    def items(text: str) -> str:
+        return _USAGE_ITEM.sub(lambda m: _paint(_NAME, m.group()), text)
+
+    lines = []
+    listing = False
+    for line in text.split("\n"):
+        found = _USAGE_ITEMS.match(line)
+        more = _USAGE_MORE.match(line) if listing else None
+        if line.startswith("Usage: "):
+            line = _heading("Usage:") + line[len("Usage:"):]
+        elif found:
+            indent, label, gap, rest = found.groups()
+            line = indent + _paint(_LABEL, label) + gap + items(rest)
+        elif more:
+            line = more.group(1) + items(more.group(2))
+        listing = bool(found or more)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
     """
     Stand in for fire.core.Display, printing to stdout instead of stderr,
@@ -264,21 +385,29 @@ class _HelpText:
     left alone: the command was complete.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, color_usage: bool, color_help: bool) -> None:
         self.incomplete = None
+        self.color_usage = color_usage
+        self.color_help = color_help
 
     def __getattr__(self, name: str) -> Any:
         return getattr(_helptext, name)
 
     def HelpText(self, component: Any, trace: Any = None, verbose: bool = False) -> str:
         if trace is None or trace.show_help or trace.HasError() or _called(trace):
-            return _helptext.HelpText(component, trace=trace, verbose=verbose)
+            text = _helptext.HelpText(component, trace=trace, verbose=verbose)
+            return _color_help(text) if self.color_help else text
         self.incomplete = trace
-        return _helptext.UsageText(component, trace=trace, verbose=verbose)
+        return self.UsageText(component, trace=trace, verbose=verbose)
+
+    def UsageText(self, component: Any, trace: Any = None, verbose: bool = False) -> str:
+        text = _helptext.UsageText(component, trace=trace, verbose=verbose)
+        return _color_usage(text) if self.color_usage else text
 
 
 _display = getattr(_fire.core, "Display", None)
 _helptext = getattr(_fire.core, "helptext", None)
+_formatting = getattr(_fire.core, "formatting", None)
 
 # Obtain the signature from the installed Fire version instead of
 # duplicating it here. This makes fireaid less dependent on Fire's
@@ -338,18 +467,34 @@ def Fire(*args: Any, **kwargs: Any) -> Any:
 def _fire_with(display: Any, *args: Any, **kwargs: Any) -> Any:
     """
     Call fire.Fire() with a stand-in for its display of help.
+
+    On a terminal, usage text is coloured, and so is help that was asked
+    for in conventional syntax. Help in Fire's native syntax is Fire's.
     """
     if _display is None or _helptext is None:
         return _fire.Fire(*args, **kwargs)
 
-    helptext = _HelpText()
+    color = _use_color()
+    marks = {}
+    if color and display is _display_stdout:
+        # What Fire marks as bold are headings, as underlined placeholders.
+        marks = {"Bold": _heading, "Underline": _placeholder}
+        if not all(hasattr(_formatting, name) for name in marks):
+            marks = {}
+    found = {name: getattr(_formatting, name) for name in marks}
+
+    helptext = _HelpText(color_usage=color, color_help=bool(marks))
     _fire.core.helptext = helptext
     _fire.core.Display = display
+    for name, stand_in in marks.items():
+        setattr(_formatting, name, stand_in)
     try:
         result = _fire.Fire(*args, **kwargs)
     finally:
         _fire.core.Display = _display
         _fire.core.helptext = _helptext
+        for name, original in found.items():
+            setattr(_formatting, name, original)
 
     if helptext.incomplete is not None:
         # Fire has printed the usage in place of a result.

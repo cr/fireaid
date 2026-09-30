@@ -2,12 +2,13 @@
 
 *A little help for Python Fire.*
 
-[Python Fire](https://github.com/google/python-fire) turns any Python
+[Python Fire](https://pypi.org/project/fire/) turns any Python
 function, class or module into a command-line tool with a single line
 of code. `fireaid` is a thin wrapper around it that adds the help
 conventions people know from tools like `git`: a `help` command,
-`--help` printed plainly to the terminal, and a short usage message
-when a command is incomplete. Everything else is Fire, unchanged.
+`--help` printed straight to the terminal, a short usage message when
+a command is incomplete, and colour that makes it all easy to read.
+Everything else is Fire, unchanged.
 
 All you need is:
 
@@ -107,6 +108,16 @@ Fire's exit code for errors:
 
 A function that returns an object is a complete command. There, Fire
 shows the help for the object, which fireaid only keeps from the pager.
+
+## Colour
+
+On a terminal, fireaid colours the usage text and the help it prints:
+headings light blue and bold, the names of commands and flags light green, and
+placeholders for argument values yellow. Output that is redirected
+stays plain, as does output to a terminal that has no colours
+according to `TERM`, and everything with `NO_COLOR` set. `FORCE_COLOR`
+switches colour on regardless. Help in Fire's native syntax looks as
+Fire makes it.
 
 `examples/pantry.py` is a small program to try all of this on, and
 `examples/tour.sh` runs through it.

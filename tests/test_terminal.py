@@ -14,7 +14,9 @@ TESTS = Path(__file__).parent
 PAGER = "sed s/^/PAGED:/"
 
 
-def run_on_terminal(command, module="fireaid", code=0, component="CLI"):
+def run_on_terminal(
+    command, module="fireaid", code=0, component="CLI", color=False, term="xterm-256color"
+):
     """Run the test program with a terminal as stdin, stdout and stderr."""
     master, slave = pty.openpty()
     try:
@@ -24,10 +26,12 @@ def run_on_terminal(command, module="fireaid", code=0, component="CLI"):
             stdout=slave,
             stderr=slave,
             env=dict(
-                os.environ,
+                {k: v for k, v in os.environ.items() if k != "FORCE_COLOR"},
                 FIREAID_TEST_MODULE=module,
                 FIREAID_TEST_COMPONENT=component,
                 PAGER=PAGER,
+                NO_COLOR="" if color else "1",
+                TERM=term,
             ),
             cwd=TESTS,
         )

@@ -26,14 +26,15 @@ class Result:
         return f"Result(code={self.code!r}, out={self.out!r}, err={self.err!r})"
 
 
-def _run(argv, module="fireaid", component="CLI", help=False):
-    env = dict(
-        os.environ,
+def _run(argv, module="fireaid", component="CLI", help=False, **variables):
+    env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "FORCE_COLOR")}
+    env.update(
         FIREAID_TEST_MODULE=module,
         FIREAID_TEST_COMPONENT=component,
         FIREAID_TEST_HELP="1" if help else "",
         PAGER="cat",
         COLUMNS="80",
+        **variables,
     )
     return Result(
         subprocess.run(
@@ -53,10 +54,11 @@ def run():
     Run the test program on a command line, with fireaid or with fire.
 
     With help, Fire is given a component that has fireaid's help command.
+    Further keyword arguments are environment variables.
     """
 
-    def run(command, module="fireaid", component="CLI", help=False):
-        return _run(["cli.py", *command.split()], module, component, help)
+    def run(command, module="fireaid", component="CLI", help=False, **variables):
+        return _run(["cli.py", *command.split()], module, component, help, **variables)
 
     return run
 
