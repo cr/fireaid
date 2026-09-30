@@ -11,7 +11,7 @@ when a command is incomplete. Everything else is Fire, unchanged.
 
 All you need is:
 
-    pip install git+https://github.com/cr/fireaid
+    pip install fireaid
 
     import fireaid as fire
 
@@ -19,13 +19,17 @@ All you need is:
 
 ## Installation
 
-Directly from the repository:
+From [PyPI](https://pypi.org/project/fireaid/):
 
-    pip install git+https://github.com/cr/fireaid
+    pip install fireaid
 
 As a dependency in another project's `pyproject.toml`:
 
-    dependencies = ["fireaid @ git+https://github.com/cr/fireaid"]
+    dependencies = ["fireaid"]
+
+The latest state of the repository:
+
+    pip install git+https://github.com/cr/fireaid
 
 From the project directory:
 
