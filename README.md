@@ -145,7 +145,7 @@ environment, `make clean` removes it.
 
 Set the new `version` in `pyproject.toml`, commit, then tag and push:
 
-    git tag v0.1.0 && git push origin main v0.1.0
+    git tag v0.1.1 && git push origin main v0.1.1
 
 The tag starts `.github/workflows/publish.yml`, which runs the tests,
 checks that the tag is the package version, builds, and publishes to
