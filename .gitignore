@@ -8,3 +8,4 @@ venv/
 Pipfile
 Pipfile.lock
 .pytest_cache/
+.vscode/
