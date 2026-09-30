@@ -31,3 +31,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Fire 0.7.1 calls a function deprecated in Python 3.14 and removed in 3.16.
+# Remove this filter once Fire has replaced it.
+filterwarnings = [
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:fire",
+]
