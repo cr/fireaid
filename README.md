@@ -1,6 +1,6 @@
 # fireaid
 
-*A little help for Python Fire.*
+*A colorful little help for Python Fire.*
 
 [Python Fire](https://pypi.org/project/fire/) turns any Python
 function, class or module into a command-line tool with a single line
@@ -156,7 +156,7 @@ environment, `make clean` removes it.
 
 Set the new `version` in `pyproject.toml`, commit, then tag and push:
 
-    git tag v0.1.1 && git push origin main v0.1.1
+    git tag v0.2.0 && git push origin main v0.2.0
 
 The tag starts `.github/workflows/publish.yml`, which runs the tests,
 checks that the tag is the package version, builds, and publishes to
