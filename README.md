@@ -1,11 +1,21 @@
 # fireaid
 
-`fireaid` is a thin, transparent wrapper around
-[Google Python Fire](https://github.com/google/python-fire). It adds the
-`help` subcommand that works just like you would expect from tools like
-`git` or `npm`. Help text also goes to *stdout* and is no longer forced
-through the pager. Running the plain command will no longer just page
-the help, but show usage info and raise an error.
+*A little help for Python Fire.*
+
+[Python Fire](https://github.com/google/python-fire) turns any Python
+function, class or module into a command-line tool with a single line
+of code. `fireaid` is a thin wrapper around it that adds the help
+conventions people know from tools like `git`: a `help` command,
+`--help` printed plainly to the terminal, and a short usage message
+when a command is incomplete. Everything else is Fire, unchanged.
+
+All you need is:
+
+    pip install git+https://github.com/cr/fireaid
+
+    import fireaid as fire
+
+    fire.Fire(MyTool)
 
 ## Installation
 

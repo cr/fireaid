@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fireaid"
 version = "0.1.0"
-description = "Transparent Google Python Fire wrapper with conventional help syntax"
+description = "Familiar help for command-line tools made with Python Fire"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
