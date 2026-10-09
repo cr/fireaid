@@ -3,10 +3,16 @@ On a terminal, Fire pages its help. fireaid prints it like other tools.
 """
 
 import os
-import pty
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("terminals here are Unix pseudo-terminals", allow_module_level=True)
+
+import pty
 
 TESTS = Path(__file__).parent
 

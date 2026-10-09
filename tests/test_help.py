@@ -7,9 +7,9 @@ import pytest
 BANNER = "INFO: Showing help"
 
 
-def native_help(run, path, component="CLI"):
+def native_help(run, path, component="CLI", help=False):
     """The help text Fire prints for its native syntax."""
-    result = run(f"{path} -- --help", module="fire", component=component)
+    result = run(f"{path} -- --help", module="fire", component=component, help=help)
     assert result.code == 0 and result.err.startswith("NAME")
     return result.err
 
@@ -35,7 +35,13 @@ def test_help_is_fires_help_on_stdout(run, command, path):
     result = run(command)
     assert result.code == 0
     assert result.err == ""
-    assert result.out == native_help(run, path)
+    if path:
+        assert result.out == native_help(run, path)
+    else:
+        # CLI is a class. Fire's help for the class itself lists only its
+        # constructor's flags; fireaid's is the help for an instance, the
+        # help command among its commands.
+        assert result.out == native_help(run, path, component="INSTANCE", help=True)
 
 
 def test_help_names_the_command(run):
@@ -147,12 +153,15 @@ HELP_ENTRY = "\n     help\n       Show help for the program, or for a command.\n
 
 def test_help_command_is_listed_in_usage(run):
     for component in ("CLI", "INSTANCE", "NONE"):
-        commands = [
-            line for line in run("", component=component).out.splitlines()
-            if line.startswith("  available commands:")
-        ]
-        assert len(commands) == 1
-        assert " help " in commands[0] + " "
+        lines = run("", component=component).out.splitlines()
+        starts = [i for i, line in enumerate(lines) if line.startswith("  available commands:")]
+        assert len(starts) == 1
+        commands = lines[starts[0]]
+        for line in lines[starts[0] + 1 :]:  # the list wraps onto indented lines
+            if not line.startswith(" " * 20):
+                break
+            commands += " " + line.strip()
+        assert " help " in commands + " "
 
 
 def test_help_command_is_listed_in_help(run):
@@ -189,3 +198,56 @@ def test_no_help_command_where_it_is_not_ours(run, component):
     for command in ("nonesuch", "help -- --help"):
         result = run(command, component=component)
         assert result == run(command, module="fire", component=component)
+
+
+# -- A class as the program: Fire shows its constructor's flags only.
+
+
+@pytest.mark.parametrize("command", ["help", "--help", "-h"])
+def test_help_for_a_class_is_help_for_its_instance(run, command):
+    assert run(command, component="CLI") == run(command, component="INSTANCE")
+
+
+def test_fire_does_not_instantiate_a_class_for_its_help(run):
+    # The premise.
+    fires = run("-- --help", module="fire", component="CLI")
+    assert "     static\n" in fires.err
+    assert "     dynamic\n" not in fires.err
+
+
+def test_help_for_a_class_with_flags(run):
+    result = run("help", component="Configured")
+    assert result.code == 0 and result.err == ""
+    out = result.out
+    assert "\nSYNOPSIS\n    cli.py <flags> GROUP | COMMAND | VALUE\n\nDESCRIPTION\n    Configured doc.\n\nFLAGS\n" in out
+    assert "\n    -v, --verbose=VERBOSE\n" in out
+    assert out.index("FLAGS\n") < out.index("GROUPS\n") < out.index("COMMANDS\n") < out.index("VALUES\n")
+    assert "     dynamic\n" in out and "     foo\n" in out and "     verbose\n" in out
+    assert run("--help", component="Configured") == result
+
+
+def test_help_for_a_class_that_needs_arguments_is_fires(run):
+    result = run("help", component="Needy")
+    assert result.code == 0
+    assert "SYNOPSIS\n    cli.py --path=PATH\n" in result.out
+    assert "ARGUMENTS\n    PATH\n" in result.out
+    assert "COMMANDS" not in result.out
+
+
+def test_native_help_for_a_class_is_fires(run):
+    for component in ("Configured", "Needy"):
+        result = run("-- --help", component=component)
+        assert result == run("-- --help", module="fire", component=component, help=True)
+        assert "COMMANDS" not in result.err
+
+
+def test_usage_for_a_class_has_no_separator(run):
+    result = run("", component="Configured")
+    assert result.code == 2
+    assert result.out.startswith("Usage: cli.py <group|command|value>\n")
+    assert result.out.endswith("\nFor detailed information on this command, run:\n  cli.py --help\n")
+    # The premise: Fire shows the separator, as the next word could be a flag.
+    fires = run("", module="fire", component="Configured", help=True)
+    assert "cli.py - GROUP | COMMAND | VALUE" in fires.out
+    # Deeper in, there is none to take out.
+    assert run("static", component="Configured").out.startswith("Usage: cli.py static <command>\n")
