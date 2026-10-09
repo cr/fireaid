@@ -1,0 +1,25 @@
+# Runs the tests on every push and pull request, on the oldest Python
+# fireaid supports and the latest stable one, as the publish workflow
+# does before a release.
+
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]  # the publish workflow tests a release itself
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.x"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: make test PYTHON=python
