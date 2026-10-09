@@ -283,8 +283,9 @@ def test_environment(server):
 
 
 def test_pipes(server):
+    # With input, stdin is a pipe: the NUL device counts as a terminal on Windows.
     target = server("Probe").target
-    assert run(["tty", "--remote", target], "Probe")[1] == run(["tty"], "Probe")[1] == "000 -\n"
+    assert run(["tty", "--remote", target], "Probe", input=b"")[1] == run(["tty"], "Probe", input=b"")[1] == "000 -\n"
 
 
 @unix
@@ -334,7 +335,7 @@ def test_client_gone_stops_the_command(server, pipes):
         env=environment("Probe"),
         cwd=TESTS,
     )
-    assert client.stdout.readline() == b"started\n"
+    assert client.stdout.readline().rstrip(b"\r\n") == b"started"
     client.kill()
     client.wait()
     # The server is free for the next client at once, not after the sleep.
@@ -359,11 +360,11 @@ def test_input_and_exit_code_between_kinds(server, pipes, client):
     if not pipes and not remote.HAS_PTY:
         pytest.skip("no server with terminals here")
     like = {"FIREAID_REMOTE_TEST_NO_PTY": client}
-    assert run(["cat", "--remote", s.target], "Probe", input=b"hello\n", **like)[1] == "hello\n"
+    assert run(["cat", "--remote", s.target], "Probe", input=b"hello\n", **like) == (0, "hello\n", ""), s.log.read_text()
     data = os.urandom(1 << 18).hex().encode()
     assert run(["cat", "--remote", s.target], "Probe", input=data, **like)[1] == data.decode()
     assert run(["fail", "--code", "7", "--remote", s.target], "Probe", **like)[0] == 7
-    assert run(["tty", "--remote", s.target], "Probe", **like)[1] == "000 -\n"
+    assert run(["tty", "--remote", s.target], "Probe", input=b"", **like) == (0, "000 -\n", ""), s.log.read_text()
 
 
 def test_pipes_only_denied_and_password(server):

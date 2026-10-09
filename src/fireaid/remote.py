@@ -366,17 +366,19 @@ class _Channel:
 
     def receive(self) -> list[tuple[int, bytes]]:
         """
-        The frames that have arrived. Raises EOFError if the peer is gone.
+        The frames that have arrived, those read along with an earlier
+        one included. Raises EOFError if the peer is gone.
         """
         try:
             data = self.sock.recv(_CHUNK)
         except (BlockingIOError, InterruptedError):
-            return []
+            data = None
         except ConnectionError:
             raise EOFError from None
-        if not data:
-            raise EOFError
-        self.incoming += data
+        if data is not None:
+            if not data:
+                raise EOFError
+            self.incoming += data
         return list(_parse(self.incoming))
 
 
@@ -721,15 +723,14 @@ class _Command:
                     if key.fileobj is channel.sock:
                         if events & selectors.EVENT_WRITE:
                             channel.flush()
-                        if events & selectors.EVENT_READ:
-                            for kind, payload in channel.receive():
-                                self.on_message(kind, payload)
                         continue
                     fd = key.fd
                     if events & selectors.EVENT_READ and fd in self.outputs:
                         self.read_output(selector, fd)
                     if events & selectors.EVENT_WRITE and fd == self.stdin:
                         self.write_input(selector)
+                for kind, payload in channel.receive():
+                    self.on_message(kind, payload)
                 self.close_input_if_done(selector)
         except (EOFError, ConnectionError, BrokenPipeError):
             return True
@@ -886,12 +887,11 @@ class _PipeCommand:
                         self.readers -= 1
                     else:
                         channel.queue(kind, data)
-                readable, writable, _ = select.select([sock], [sock] if channel.outgoing else [], [], 0.05)
+                _, writable, _ = select.select([sock], [sock] if channel.outgoing else [], [], 0.05)
                 if writable:
                     channel.flush()
-                if readable:
-                    for kind, payload in channel.receive():
-                        self.on_message(kind, payload)
+                for kind, payload in channel.receive():
+                    self.on_message(kind, payload)
         except (EOFError, ConnectionError, _ProtocolError):
             return True
         return False
@@ -966,7 +966,7 @@ class _Client:
         self.target = target
         self.code: int | None = None
         self.signals: list[int] = []
-        self.last_interrupt = 0.0
+        self.last_interrupt: float | None = None
         self.pty = True  # whether the server gives commands a terminal
 
     def run(self, argv: list[str]) -> int:
@@ -1073,9 +1073,8 @@ class _Client:
                     [sock, *stdin], [sock] if channel.outgoing else [], [], 0.05 if threaded else _TICK)
                 if sock in writable:
                     channel.flush()
-                if sock in readable:
-                    for kind, payload in channel.receive():
-                        self.on_message(kind, payload)
+                for kind, payload in channel.receive():
+                    self.on_message(kind, payload)
                 if 0 in readable:
                     try:
                         data = os.read(0, _CHUNK)
@@ -1116,8 +1115,8 @@ class _Client:
                     self.channel.queue(WINCH, size)
             elif sig == signal.SIGINT:
                 now = time.monotonic()
-                if now - self.last_interrupt < 1.0:
-                    raise SystemExit(128 + signal.SIGINT)
+                if self.last_interrupt is not None and now - self.last_interrupt < 1.0:
+                    raise SystemExit(128 + signal.SIGINT)  # the second one is for us
                 self.last_interrupt = now
                 self.channel.queue(SIGNAL, {"name": "INT"})
 
