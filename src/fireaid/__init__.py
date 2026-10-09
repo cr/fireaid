@@ -263,8 +263,6 @@ def _remote_config(remote: Any) -> Any:
         remote = Remote()
     if not isinstance(remote, Remote):
         raise TypeError(f"remote must be True, False or a fireaid.Remote, not {remote!r}")
-    if os.name != "posix":
-        raise NotImplementedError("remote control needs a Unix system")
     return remote
 
 

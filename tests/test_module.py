@@ -209,11 +209,9 @@ def test_component_that_cannot_take_a_help_command(capsys):
     assert exit.value.code == 0
 
 
-def test_remote_is_for_unix_systems():
-    """Elsewhere, asking for it fails at once, and clearly."""
-    if os.name == "posix":
-        assert isinstance(fireaid._remote_config(True), fireaid.Remote)
-    else:
-        with pytest.raises(NotImplementedError, match="Unix"):
-            fireaid.Fire(object(), command=["x"], remote=True)
+def test_remote_config():
+    assert isinstance(fireaid._remote_config(True), fireaid.Remote)
     assert fireaid._remote_config(False) is None
+    assert fireaid._remote_config(None) is None
+    with pytest.raises(TypeError):
+        fireaid._remote_config("boat")

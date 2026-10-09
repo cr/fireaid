@@ -63,6 +63,8 @@ def test_progress_is_plain_lines_without_a_terminal():
     assert " DEBUG " not in err
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="rich colours the legacy Windows console through its API, not with escape codes")
 def test_progress_is_drawn_on_a_terminal():
     completed = progress("copy", "--size=40000", FORCE_COLOR="1")  # rich then treats stderr as a terminal
     assert completed.returncode == 0

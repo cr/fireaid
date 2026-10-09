@@ -6,18 +6,19 @@ command, and a ``--remote [PASSWORD@]HOST[:PORT]`` flag that runs the
 rest of the command line on such a server. The server runs every
 command line in a fresh process of the program, whose standard input,
 output and error are terminals or pipes as the client's are, so that
-the program behaves as it does locally.
+the program behaves as it does locally. A server on Windows, which has
+no pseudo-terminals, gives every command pipes.
 
-Unix only. Imported by fireaid when a program asks for it.
+Imported by fireaid when a program asks for it.
 """
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
 import os
+import queue
 import secrets
 import select
 import selectors
@@ -26,12 +27,21 @@ import socket
 import struct
 import subprocess
 import sys
-import termios
+import threading
 import time
-import tty
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # Windows
+    fcntl = termios = tty = None
+
+# Whether this system has pseudo-terminals for the commands a server runs.
+HAS_PTY = termios is not None and hasattr(os, "openpty")
 
 PROTOCOL = 1
 FLAG = "--remote"
@@ -42,6 +52,10 @@ CHILD_VARIABLE = "FIREAID_REMOTE_CHILD"
 # Binds the server to this address instead of the one the password
 # selects. For the tests, which must not trigger a firewall dialog.
 _TEST_BIND_VARIABLE = "FIREAID_REMOTE_TEST_BIND"
+
+# Makes server and client behave as on Windows: the server gives commands
+# pipes, the client leaves its terminal alone and reads it in a thread.
+_TEST_NO_PTY_VARIABLE = "FIREAID_REMOTE_TEST_NO_PTY"
 
 # What decides how a program presents its output, taken from the client.
 TERMINAL_VARIABLES = (
@@ -68,11 +82,21 @@ _HEADER = struct.Struct(">IB")
 _MAX_FRAME = 1 << 20
 _CHUNK = 1 << 16
 _BACKLOG = 1 << 20  # buffered output beyond which reading pauses
-_SIGNALS = {"INT": signal.SIGINT, "TERM": signal.SIGTERM, "HUP": signal.SIGHUP, "QUIT": signal.SIGQUIT}
+_SIGNALS = {name: getattr(signal, "SIG" + name) for name in ("INT", "TERM", "HUP", "QUIT")
+            if hasattr(signal, "SIG" + name)}
+_CONTROL_C_EXIT = 0xC000013A  # how Windows reports a process ended by Ctrl-Break
 
 _CONNECT_TIMEOUT = 5.0
 _HANDSHAKE_TIMEOUT = 10.0
 _TICK = 0.2
+
+
+def _like_windows() -> bool:
+    return os.name == "nt" or bool(os.environ.get(_TEST_NO_PTY_VARIABLE))
+
+
+def _pty_available() -> bool:
+    return HAS_PTY and not _like_windows()
 
 
 class RemoteError(Exception):
@@ -249,6 +273,8 @@ class Launch:
         script = sys.argv[0] if sys.argv else ""
         if not script or not os.path.isfile(script):
             return cls((), cwd, f"cannot start this program again: {script or 'no script'} is not a file")
+        if script.lower().endswith(".exe"):
+            return cls((script,), cwd)  # a console script's launcher on Windows
         return cls((sys.executable, script), cwd)
 
 
@@ -408,11 +434,16 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
     def stop(sig, frame):
         raise SystemExit(0)
 
-    handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGHUP)}
-    print(f"{prog}: serving on {host}:{listener.getsockname()[1]}", file=sys.stderr, flush=True)
+    handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
+    terminals = "" if _pty_available() else ", commands get pipes"
+    print(f"{prog}: serving on {host}:{listener.getsockname()[1]}{terminals}", file=sys.stderr, flush=True)
+    listener.settimeout(1.0)  # so that Ctrl-C gets through on Windows
     try:
         while True:
-            sock, peer = listener.accept()
+            try:
+                sock, peer = listener.accept()
+            except socket.timeout:
+                continue
             try:
                 _Session(sock, launch, deny, prog, variable, password).run()
             except Exception as e:  # one client must not stop the server
@@ -453,7 +484,8 @@ class _Session:
         if request is None:
             return
         sock.setblocking(False)
-        _Command(self.channel, self.launch, request, self.variable).run()
+        runner = _Command if _pty_available() else _PipeCommand
+        runner(self.channel, self.launch, request, self.variable).run()
 
     def refuse(self, message: str, code: int) -> None:
         print(f"{self.prog}: {self.peer}: {message}", file=sys.stderr, flush=True)
@@ -465,7 +497,8 @@ class _Session:
     def handshake(self) -> dict | None:
         channel = self.channel
         nonce = secrets.token_bytes(32)
-        channel.write(CHALLENGE, {"proto": PROTOCOL, "nonce": nonce.hex(), "auth": self.password is not None})
+        channel.write(CHALLENGE, {"proto": PROTOCOL, "nonce": nonce.hex(), "auth": self.password is not None,
+                                  "pty": _pty_available()})
 
         hello = _json(channel.expect(HELLO))
         if hello.get("proto") != PROTOCOL:
@@ -498,6 +531,70 @@ class _Session:
         return request
 
 
+def _environment(request: dict, variable: str) -> dict:
+    # The client's terminal variables replace ours, and the program's
+    # own --remote variable would send the command on again.
+    env = {k: v for k, v in os.environ.items() if k not in TERMINAL_VARIABLES and k != variable}
+    env.update(request["env"])
+    env[CHILD_VARIABLE] = "1"
+    return env
+
+
+def _exit_code(returncode: int) -> int:
+    """A child's return code as the client's exit code."""
+    if returncode < 0:
+        return 128 - returncode  # ended by a signal
+    if returncode == _CONTROL_C_EXIT:
+        return 128 + signal.SIGINT
+    return returncode if returncode < 256 else 1
+
+
+def _interrupt(process: subprocess.Popen, name: str) -> None:
+    """Send the signal of that name to the command, and what it started."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            # The nearest thing: the child is its own process group.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        elif name in _SIGNALS:
+            os.killpg(process.pid, _SIGNALS[name])
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _kill(process: subprocess.Popen | None) -> None:
+    """End the command, and what it started, as its client has gone."""
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        steps = ((process.terminate, 2.0), (process.kill, None))
+    else:
+        steps = ((lambda: os.killpg(process.pid, signal.SIGHUP), 2.0),
+                 (lambda: os.killpg(process.pid, signal.SIGKILL), None))
+    for step, wait in steps:
+        try:
+            step()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            process.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _send_exit(channel: _Channel, returncode: int) -> None:
+    channel.queue(EXIT, {"code": _exit_code(returncode)})
+    sock = channel.sock
+    sock.setblocking(True)
+    sock.settimeout(_HANDSHAKE_TIMEOUT)
+    try:
+        sock.sendall(channel.outgoing)
+    except OSError:
+        pass
+
+
 def _take_terminal() -> None:
     """In the child: make the terminal among its stdio the controlling one."""
     for fd in (0, 1, 2):
@@ -524,14 +621,6 @@ class _Command:
         self.pending = bytearray()
         self.stdin_eof = False
         self.process: subprocess.Popen | None = None
-
-    def environment(self) -> dict:
-        # The client's terminal variables replace ours, and the program's
-        # own --remote variable would send the command on again.
-        env = {k: v for k, v in os.environ.items() if k not in TERMINAL_VARIABLES and k != self.variable}
-        env.update(self.request["env"])
-        env[CHILD_VARIABLE] = "1"
-        return env
 
     def spawn(self) -> None:
         stdin_tty, stdout_tty, stderr_tty = (bool(x) for x in self.request["tty"])
@@ -584,7 +673,7 @@ class _Command:
                 stdout=child[1],
                 stderr=child[2],
                 cwd=self.launch.cwd,
-                env=self.environment(),
+                env=_environment(self.request, self.variable),
                 start_new_session=True,
                 preexec_fn=_take_terminal if slave is not None else None,
             )
@@ -607,29 +696,10 @@ class _Command:
         if gone:
             self.kill()
             return
-        code = self.process.wait()
-        self.channel.queue(EXIT, {"code": 128 - code if code < 0 else code})
-        sock = self.channel.sock
-        sock.setblocking(True)
-        sock.settimeout(_HANDSHAKE_TIMEOUT)
-        try:
-            sock.sendall(self.channel.outgoing)
-        except OSError:
-            pass
+        _send_exit(self.channel, self.process.wait())
 
     def kill(self) -> None:
-        if self.process is None or self.process.poll() is not None:
-            return
-        for sig, wait in ((signal.SIGHUP, 2.0), (signal.SIGKILL, None)):
-            try:
-                os.killpg(self.process.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                self.process.wait(wait)
-                return
-            except subprocess.TimeoutExpired:
-                pass
+        _kill(self.process)
 
     def relay(self) -> bool:
         """Relay until the command is done. Returns whether the client went away."""
@@ -716,12 +786,125 @@ class _Command:
             if self.master is not None:
                 _set_size(self.master, _json(payload))
         elif kind == SIGNAL:
-            sig = _SIGNALS.get(_json(payload).get("name"))
-            if sig is not None:
-                try:
-                    os.killpg(self.process.pid, sig)
-                except (ProcessLookupError, PermissionError):
-                    pass
+            _interrupt(self.process, str(_json(payload).get("name")))
+        else:
+            raise _ProtocolError(f"unexpected message {kind}")
+
+
+class _PipeCommand:
+    """
+    A command line running in a child process with pipes for its stdio.
+
+    For systems without pseudo-terminals, Windows above all, where pipes
+    cannot be watched together with the socket either: threads read the
+    command's output and write its input, the main loop minds the socket.
+    """
+
+    def __init__(self, channel: _Channel, launch: Launch, request: dict, variable: str) -> None:
+        self.channel = channel
+        self.launch = launch
+        self.request = request
+        self.variable = variable
+        self.process: subprocess.Popen | None = None
+        self.output: queue.Queue = queue.Queue(maxsize=64)  # (kind, data), data None at the end
+        self.input: queue.Queue = queue.Queue()  # data, None at the end
+        self.readers = 0
+
+    def spawn(self) -> None:
+        options: dict = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" \
+            else {"start_new_session": True}
+        self.process = subprocess.Popen(
+            [*self.launch.prefix, *self.request["argv"]],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if self.request.get("same") else subprocess.PIPE,
+            cwd=self.launch.cwd,
+            env=_environment(self.request, self.variable),
+            **options,
+        )
+        for pipe, kind in ((self.process.stdout, STDOUT), (self.process.stderr, STDERR)):
+            if pipe is not None:
+                self.readers += 1
+                threading.Thread(target=self.read, args=(pipe, kind), daemon=True).start()
+        threading.Thread(target=self.write, daemon=True).start()
+
+    def read(self, pipe: Any, kind: int) -> None:
+        try:
+            while True:
+                data = pipe.read1(_CHUNK)
+                if not data:
+                    break
+                self.output.put((kind, data))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.output.put((kind, None))
+
+    def write(self) -> None:
+        stdin = self.process.stdin
+        try:
+            while True:
+                data = self.input.get()
+                if data is None:
+                    break
+                stdin.write(data)
+                stdin.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
+    def run(self) -> None:
+        try:
+            self.spawn()
+            gone = self.relay()
+        except BaseException:
+            _kill(self.process)
+            raise
+        finally:
+            self.input.put(None)
+        if gone:
+            _kill(self.process)
+            return
+        _send_exit(self.channel, self.process.wait())
+
+    def relay(self) -> bool:
+        """Relay until the command is done. Returns whether the client went away."""
+        channel = self.channel
+        sock = channel.sock
+        try:
+            while self.readers or self.process.poll() is None:
+                while len(channel.outgoing) < _BACKLOG:
+                    try:
+                        kind, data = self.output.get_nowait()
+                    except queue.Empty:
+                        break
+                    if data is None:
+                        self.readers -= 1
+                    else:
+                        channel.queue(kind, data)
+                readable, writable, _ = select.select([sock], [sock] if channel.outgoing else [], [], 0.05)
+                if writable:
+                    channel.flush()
+                if readable:
+                    for kind, payload in channel.receive():
+                        self.on_message(kind, payload)
+        except (EOFError, ConnectionError, _ProtocolError):
+            return True
+        return False
+
+    def on_message(self, kind: int, payload: bytes) -> None:
+        if kind == STDIN:
+            self.input.put(payload)
+        elif kind == STDIN_EOF:
+            self.input.put(None)
+        elif kind == WINCH:
+            pass  # no terminal to resize
+        elif kind == SIGNAL:
+            _interrupt(self.process, str(_json(payload).get("name")))
         else:
             raise _ProtocolError(f"unexpected message {kind}")
 
@@ -730,6 +913,8 @@ class _Command:
 
 
 def _same_file(a: int, b: int) -> bool:
+    if os.name == "nt":
+        return False  # pipes have no telling identity there
     try:
         sa, sb = os.fstat(a), os.fstat(b)
     except OSError:
@@ -743,7 +928,10 @@ def _write_all(fd: int, data: bytes) -> None:
         try:
             written = os.write(fd, view)
         except BlockingIOError:
-            select.select([], [fd], [])
+            if os.name == "nt":
+                time.sleep(0.01)
+            else:
+                select.select([], [fd], [])
             continue
         view = view[written:]
 
@@ -760,6 +948,18 @@ def run_client(target: Target, argv: Sequence[str]) -> int:
         sock.close()
 
 
+def _read_stdin(lines: queue.Queue) -> None:
+    """Read stdin until its end, into a queue: b"" is the end."""
+    while True:
+        try:
+            data = os.read(0, _CHUNK)
+        except OSError:
+            data = b""
+        lines.put(data)
+        if not data:
+            return
+
+
 class _Client:
     def __init__(self, sock: socket.socket, target: Target) -> None:
         self.channel = _Channel(sock)
@@ -767,6 +967,7 @@ class _Client:
         self.code: int | None = None
         self.signals: list[int] = []
         self.last_interrupt = 0.0
+        self.pty = True  # whether the server gives commands a terminal
 
     def run(self, argv: list[str]) -> int:
         try:
@@ -779,7 +980,9 @@ class _Client:
         flags = [os.isatty(fd) for fd in (0, 1, 2)]
         self.terminal = next((fd for fd in (1, 2, 0) if flags[fd]), 2)
         saved = None
-        if flags[0]:
+        if flags[0] and self.pty and termios is not None and not _like_windows():
+            # The command's terminal on the server does the echoing and
+            # the line editing; this one passes the keys on as they come.
             try:
                 saved = termios.tcgetattr(0)
                 tty.setraw(0, termios.TCSADRAIN)
@@ -804,8 +1007,11 @@ class _Client:
         def leave(sig, frame):
             raise SystemExit(128 + sig)
 
-        for sig, handler in ((signal.SIGINT, note), (signal.SIGWINCH, note),
-                             (signal.SIGTERM, leave), (signal.SIGHUP, leave)):
+        wanted = [(signal.SIGINT, note), (signal.SIGTERM, leave)]
+        for name, handler in (("SIGWINCH", note), ("SIGHUP", leave)):
+            if hasattr(signal, name):
+                wanted.append((getattr(signal, name), handler))
+        for sig, handler in wanted:
             try:
                 handlers[sig] = signal.signal(sig, handler)
             except (ValueError, OSError):  # not the main thread
@@ -833,6 +1039,7 @@ class _Client:
         if challenge.get("proto") != PROTOCOL:
             raise RemoteError(f"{self.target} speaks fireaid remote protocol {challenge.get('proto')}, "
                               f"this client speaks {PROTOCOL}")
+        self.pty = bool(challenge.get("pty", True))
         channel.write(HELLO, {"proto": PROTOCOL})
         if challenge.get("auth"):
             try:
@@ -852,45 +1059,53 @@ class _Client:
 
     def relay(self, stdin_is_tty: bool) -> int:
         channel = self.channel
-        selector = selectors.SelectSelector()
+        sock = channel.sock
+        threaded = _like_windows()  # stdin cannot be selected on Windows
+        lines: queue.Queue = queue.Queue()
+        if threaded:
+            threading.Thread(target=_read_stdin, args=(lines,), daemon=True).start()
         reading_stdin = True
         try:
             while self.code is None:
                 self.handle_signals()
-                _watch(selector, channel.sock,
-                       selectors.EVENT_READ | (selectors.EVENT_WRITE if channel.outgoing else 0))
-                if reading_stdin:
-                    _watch(selector, 0, selectors.EVENT_READ if len(channel.outgoing) < _BACKLOG else 0)
-                for key, events in selector.select(_TICK):
-                    if key.fileobj is channel.sock:
-                        if events & selectors.EVENT_WRITE:
-                            channel.flush()
-                        if events & selectors.EVENT_READ:
-                            for kind, payload in channel.receive():
-                                self.on_message(kind, payload)
-                    elif reading_stdin:
-                        try:
-                            data = os.read(0, _CHUNK)
-                        except OSError:
-                            data = b""
-                        if data:
-                            channel.queue(STDIN, data)
-                        else:
-                            reading_stdin = False
-                            _watch(selector, 0, 0)
-                            if not stdin_is_tty:
-                                channel.queue(STDIN_EOF)
+                stdin = [0] if reading_stdin and not threaded and len(channel.outgoing) < _BACKLOG else []
+                readable, writable, _ = select.select(
+                    [sock, *stdin], [sock] if channel.outgoing else [], [], 0.05 if threaded else _TICK)
+                if sock in writable:
+                    channel.flush()
+                if sock in readable:
+                    for kind, payload in channel.receive():
+                        self.on_message(kind, payload)
+                if 0 in readable:
+                    try:
+                        data = os.read(0, _CHUNK)
+                    except OSError:
+                        data = b""
+                    reading_stdin = self.relay_input(data, stdin_is_tty)
+                while threaded and reading_stdin and len(channel.outgoing) < _BACKLOG:
+                    try:
+                        data = lines.get_nowait()
+                    except queue.Empty:
+                        break
+                    reading_stdin = self.relay_input(data, stdin_is_tty)
                 channel.flush()
         except EOFError:
             raise RemoteError(f"{self.target} closed the connection") from None
         except BrokenPipeError:
             # Our own output has gone away. The server stops the command.
-            return 128 + signal.SIGPIPE
+            return 128 + getattr(signal, "SIGPIPE", 13)
         except ConnectionError as e:
             raise RemoteError(f"{self.target}: {e}") from None
-        finally:
-            selector.close()
         return self.code
+
+    def relay_input(self, data: bytes, stdin_is_tty: bool) -> bool:
+        """Pass stdin's data on. Returns whether there is more to read."""
+        if data:
+            self.channel.queue(STDIN, data)
+            return True
+        if not stdin_is_tty:
+            self.channel.queue(STDIN_EOF)
+        return False
 
     def handle_signals(self) -> None:
         while self.signals:

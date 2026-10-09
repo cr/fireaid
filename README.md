@@ -177,7 +177,12 @@ Without a password, the server only accepts connections from its own
 computer. With one, it accepts them from anywhere, and the client must
 know the password, which itself never crosses the network. The
 connection is not encrypted, so keep it to a network you trust. The
-server serves one client at a time. Remote control needs a Unix system.
+server serves one client at a time.
+
+A server on Windows, which has no pseudo-terminals, gives every command
+pipes: the command behaves as if its output were redirected, and Ctrl-C
+at the client ends it. A client on Windows gets the full treatment from
+a server on Linux or macOS; the two kinds work together either way.
 
 ## Limits
 

@@ -95,7 +95,8 @@ class Probe(CLI):
 
     def cat(self):
         """Copy stdin to stdout."""
-        sys.stdout.write(sys.stdin.read())
+        sys.stdout.flush()
+        sys.stdout.buffer.write(sys.stdin.buffer.read())
 
     def fail(self, code=3):
         """Exit with a code."""
@@ -112,9 +113,14 @@ class Probe(CLI):
             print(i, file=(sys.stdout, sys.stderr)[i % 2], flush=True)
 
     def sleep(self, seconds=30):
-        """Sleep."""
+        """Sleep, and say so on stderr when interrupted."""
         print("started", flush=True)
-        time.sleep(seconds)
+        try:
+            time.sleep(seconds)
+        except KeyboardInterrupt:
+            # Whether Python prints a traceback for an uncaught one varies.
+            print("interrupted", file=sys.stderr, flush=True)
+            sys.exit(130)
         return "slept"
 
 

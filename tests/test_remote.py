@@ -1,6 +1,10 @@
 """
 Remote control: a command line run through a server behaves as it does
 locally, and the server runs only what it may.
+
+On Windows, which has no pseudo-terminals, a server gives commands pipes.
+FIREAID_REMOTE_TEST_NO_PTY makes a server or client anywhere behave like
+one on Windows, so that the two kinds are tested against each other.
 """
 
 import os
@@ -12,16 +16,17 @@ from pathlib import Path
 
 import fireaid
 import pytest
-
-if sys.platform == "win32":
-    pytest.skip("remote control needs a Unix system", allow_module_level=True)
-
-import fcntl
-import pty
-import struct
-import termios
-
 from fireaid import remote
+
+try:
+    import fcntl
+    import pty
+    import struct
+    import termios
+except ImportError:  # Windows
+    pty = None
+
+unix = pytest.mark.skipif(pty is None, reason="needs Unix terminals and signals")
 
 TESTS = Path(__file__).parent
 PASSWORD = "p@ss word"
@@ -42,6 +47,7 @@ def environment(component, **variables):
 
 def run(argv, component="CLI", input=None, **variables):
     """Run the test program, remote-controlled, without a terminal."""
+    variables.setdefault("FIREAID_REMOTE_TEST_NO_PTY", "")
     completed = subprocess.run(
         [sys.executable, "cli.py", *argv],
         input=input,
@@ -51,11 +57,13 @@ def run(argv, component="CLI", input=None, **variables):
         cwd=TESTS,
         timeout=30,
     )
-    return completed.returncode, completed.stdout.decode(), completed.stderr.decode()
+    # Newlines as text mode would give them, since the program prints in text mode.
+    return completed.returncode, completed.stdout.decode().replace("\r\n", "\n"), \
+        completed.stderr.decode().replace("\r\n", "\n")
 
 
 class Server:
-    def __init__(self, component, password, log):
+    def __init__(self, component, password, log, pipes=False):
         argv = ["server", "--port", "0"] + ([f"--password={PASSWORD}"] if password else [])
         self.log = log
         self.process = subprocess.Popen(
@@ -63,7 +71,8 @@ class Server:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=log.open("w"),
-            env=environment(component, FIREAID_REMOTE_TEST_BIND="127.0.0.1"),
+            env=environment(component, FIREAID_REMOTE_TEST_BIND="127.0.0.1",
+                            FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else ""),
             cwd=TESTS,
         )
         deadline = time.monotonic() + 10
@@ -71,7 +80,9 @@ class Server:
             assert self.process.poll() is None, log.read_text()
             assert time.monotonic() < deadline, "the server does not start"
             time.sleep(0.05)
-        self.port = int(log.read_text().split("\n")[0].rsplit(":", 1)[1])
+        first = log.read_text().split("\n")[0]
+        self.pipes = first.endswith(", commands get pipes")
+        self.port = int(first.rsplit(":", 1)[1].split(",")[0])
         self.target = f"{PASSWORD}@127.0.0.1:{self.port}" if password else f"127.0.0.1:{self.port}"
 
     def stop(self):
@@ -84,10 +95,10 @@ def server(tmp_path_factory):
     """A server for a component, with or without a password, started once."""
     servers = {}
 
-    def server(component="CLI", password=False):
-        key = (component, password)
+    def server(component="CLI", password=False, pipes=False):
+        key = (component, password, pipes)
         if key not in servers:
-            servers[key] = Server(component, password, tmp_path_factory.mktemp("server") / "log")
+            servers[key] = Server(component, password, tmp_path_factory.mktemp("server") / "log", pipes)
         return servers[key]
 
     yield server
@@ -276,6 +287,7 @@ def test_pipes(server):
     assert run(["tty", "--remote", target], "Probe")[1] == run(["tty"], "Probe")[1] == "000 -\n"
 
 
+@unix
 def test_merged_output_keeps_its_order(server):
     """2>&1: the program writes to one stream, which keeps its order."""
     target = server("Probe").target
@@ -312,8 +324,9 @@ def test_unreachable():
     assert err.startswith("cli.py: cannot reach 127.0.0.1:1:")
 
 
-def test_client_gone_stops_the_command(server):
-    target = server("Probe").target
+@pytest.mark.parametrize("pipes", [False, True])
+def test_client_gone_stops_the_command(server, pipes):
+    target = server("Probe", pipes=pipes).target
     client = subprocess.Popen(
         [sys.executable, "cli.py", "sleep", "--remote", target],
         stdin=subprocess.DEVNULL,
@@ -326,6 +339,57 @@ def test_client_gone_stops_the_command(server):
     client.wait()
     # The server is free for the next client at once, not after the sleep.
     assert run(["tty", "--remote", target], "Probe")[0] == 0
+
+
+# -- Pipes only: a server on Windows, or one made to behave like it
+
+
+@pytest.mark.parametrize("command", ["foo x", "help foo", "nonesuch", "echo say help"])
+def test_pipes_only_server_runs_as_locally(server, command):
+    s = server(pipes=True)
+    assert s.pipes
+    assert run([*command.split(), "--remote", s.target]) == run(command.split())
+
+
+@pytest.mark.parametrize("client", ["", "1"], ids=["client", "windows-like client"])
+@pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
+def test_input_and_exit_code_between_kinds(server, pipes, client):
+    """Unix and Windows-like servers and clients, in every combination."""
+    s = server("Probe", pipes=pipes)
+    if not pipes and not remote.HAS_PTY:
+        pytest.skip("no server with terminals here")
+    like = {"FIREAID_REMOTE_TEST_NO_PTY": client}
+    assert run(["cat", "--remote", s.target], "Probe", input=b"hello\n", **like)[1] == "hello\n"
+    data = os.urandom(1 << 18).hex().encode()
+    assert run(["cat", "--remote", s.target], "Probe", input=data, **like)[1] == data.decode()
+    assert run(["fail", "--code", "7", "--remote", s.target], "Probe", **like)[0] == 7
+    assert run(["tty", "--remote", s.target], "Probe", **like)[1] == "000 -\n"
+
+
+def test_pipes_only_denied_and_password(server):
+    s = server(pipes=True)
+    code, out, err = run(["static", "bar", "--remote", s.target])
+    assert (code, out) == (2, "") and "is not available remotely" in err
+
+
+@unix
+@pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
+def test_interrupt_without_a_terminal(server, pipes):
+    target = server("Probe", pipes=pipes).target
+    client = subprocess.Popen(
+        [sys.executable, "cli.py", "sleep", "--remote", target],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment("Probe"),
+        cwd=TESTS,
+        # Python ignores SIGINT in a child of a non-interactive shell; undo that.
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
+    )
+    assert client.stdout.readline() == b"started\n"
+    client.send_signal(signal.SIGINT)
+    assert client.wait(10) == 128 + signal.SIGINT
+    assert client.stderr.read() == b"interrupted\n"
 
 
 # -- Terminals
@@ -348,6 +412,9 @@ def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"
             stderr=slave,
             env=environment(component, TERM="xterm-256color", **variables),
             cwd=TESTS,
+            # Its own terminal, as from a shell: Ctrl-C typed there reaches it.
+            start_new_session=True,
+            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),
         )
     finally:
         os.close(slave)
@@ -370,11 +437,34 @@ def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"
     return process.wait(30), output.decode().replace("\r\n", "\n"), stdout
 
 
+@unix
 def test_terminal(server):
     target = server("Probe").target
     assert on_terminal(["tty", "--remote", target]) == on_terminal(["tty"]) == (0, "111 80x24\n", "")
 
 
+@unix
+def test_windows_like_client_on_a_terminal(server):
+    """Its terminal stays as it is; the command still gets one on the server."""
+    target = server("Probe").target
+    like = {"FIREAID_REMOTE_TEST_NO_PTY": "1"}
+    assert on_terminal(["tty", "--remote", target], **like) == (0, "111 80x24\n", "")
+    assert on_terminal(["color", "--remote", target], stdout_tty=False, **like) == (0, "\x1b[31mred\x1b[0m\n", "result\n")
+
+
+@unix
+def test_terminal_client_of_a_pipes_only_server(server):
+    """The command gets pipes, and so behaves as if redirected."""
+    target = server("Probe", pipes=True).target
+    assert on_terminal(["tty", "--remote", target]) == (0, "000 -\n", "")
+    assert on_terminal(["color", "--remote", target]) == (0, "plain\nresult\n", "")
+    # Ctrl-C at a cooked terminal interrupts the client, which passes it on.
+    code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\x03", wait_for=b"started")
+    assert code == 128 + signal.SIGINT
+    assert output.endswith("interrupted\n")
+
+
+@unix
 def test_terminal_for_stderr_and_a_pipe_for_stdout(server):
     target = server("Probe").target
     local = on_terminal(["color"], stdout_tty=False)
@@ -383,26 +473,9 @@ def test_terminal_for_stderr_and_a_pipe_for_stdout(server):
     assert on_terminal(["tty", "--remote", target], stdout_tty=False) == (0, "", "101 80x24\n")
 
 
+@unix
 def test_ctrl_c(server):
     target = server("Probe").target
     code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\x03", wait_for=b"started")
     assert code == 128 + signal.SIGINT
-    assert "KeyboardInterrupt" in output
-
-
-def test_interrupt_without_a_terminal(server):
-    target = server("Probe").target
-    client = subprocess.Popen(
-        [sys.executable, "cli.py", "sleep", "--remote", target],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment("Probe"),
-        cwd=TESTS,
-        # Python ignores SIGINT in a child of a non-interactive shell; undo that.
-        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
-    )
-    assert client.stdout.readline() == b"started\n"
-    client.send_signal(signal.SIGINT)
-    assert client.wait(10) == 128 + signal.SIGINT
-    assert b"KeyboardInterrupt" in client.stderr.read()
+    assert output.endswith("interrupted\n")
