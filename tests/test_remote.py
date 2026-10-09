@@ -10,6 +10,7 @@ one on Windows, so that the two kinds are tested against each other.
 import errno
 import inspect
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -65,12 +66,97 @@ def run(argv, component="CLI", input=None, **variables):
         completed.stderr.decode().replace("\r\n", "\n")
 
 
+class Log:
+    """
+    The server's log, read as events.
+
+    The server's wording is pinned here and nowhere else, so that a
+    rewording changes one place. Tests ask whether something happened.
+    """
+
+    SERVING = re.compile(r"serving on (?P<host>\S+?):(?P<port>\d+)(?P<notes>[^\n]*)")
+
+    def __init__(self, path):
+        self.path = path
+
+    @property
+    def text(self):
+        return self.path.read_text()
+
+    def wait(self, happened, timeout=10):
+        """Wait until happened(text) holds; return the text then."""
+        deadline = time.monotonic() + timeout
+        while not happened(self.text) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.text
+
+    # -- what the program's setup hook saw (tests/cli.py prints it)
+
+    def setup_debug(self):
+        m = re.search(r"^SETUP debug=(True|False)$", self.text, re.M)
+        return None if m is None else m.group(1) == "True"
+
+    # -- the server's start
+
+    def serving(self):
+        return self.SERVING.search(self.text)
+
+    def port(self):
+        return int(self.serving().group("port"))
+
+    def host(self):
+        return self.serving().group("host")
+
+    def without_password(self):
+        return "no password" in self.serving().group("notes")
+
+    def pipes_only(self):
+        return "pipes" in self.serving().group("notes")
+
+    def warned_open(self):
+        return "anyone who can reach this port" in self.text
+
+    # -- clients and commands
+
+    @staticmethod
+    def connected(text):
+        return "connected" in text
+
+    @staticmethod
+    def finished(text):
+        return "done" in text
+
+    @staticmethod
+    def gone_in_handshake(text):
+        return "gone during the handshake" in text
+
+    @staticmethod
+    def ran(text, words):
+        return f"runs: {words}" in text
+
+    @staticmethod
+    def exited(text, code):
+        return f"exit {code} after" in text
+
+    @staticmethod
+    def launched(text, words):
+        return "as: " in text and f" {words} in " in text
+
+    @staticmethod
+    def terminal(text, flags):
+        return f"tty {flags}" in text
+
+    @staticmethod
+    def refused(text, path):
+        return f"'{path}' is not available remotely" in text
+
+
 class Server:
     def __init__(self, component, password, log, pipes=False, debug=False):
         # Loopback, so that no firewall asks about the tests.
         argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={PASSWORD}"] if password else [])
         argv += ["--debug"] if debug else []
-        self.log = log
+        self.log = Log(log)
         self.process = subprocess.Popen(
             [sys.executable, "cli.py", *argv],
             stdin=subprocess.DEVNULL,
@@ -80,13 +166,12 @@ class Server:
             cwd=TESTS,
         )
         deadline = time.monotonic() + 10
-        while "serving on" not in log.read_text():
-            assert self.process.poll() is None, log.read_text()
+        while not self.log.serving():
+            assert self.process.poll() is None, self.log.text
             assert time.monotonic() < deadline, "the server does not start"
             time.sleep(0.05)
-        self.setup_line, first = log.read_text().split("\n")[:2]  # the program's setup hook ran first
-        self.pipes = first.endswith(", commands get pipes")
-        self.port = int(first.rsplit(":", 1)[1].split(",")[0])
+        self.pipes = self.log.pipes_only()
+        self.port = self.log.port()
         self.target = f"{PASSWORD}@127.0.0.1:{self.port}" if password else f"127.0.0.1:{self.port}"
 
     def stop(self):
@@ -210,54 +295,44 @@ def test_open_server_without_a_password_warns(tmp_path):
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log.open("w"),
         env=environment("INSTANCE"), cwd=TESTS,
     )
+    log = Log(log)
     try:
-        deadline = time.monotonic() + 10
-        while "warning" not in log.read_text() and time.monotonic() < deadline:
-            time.sleep(0.05)
+        log.wait(lambda text: "anyone who can reach" in text)
     finally:
         process.terminate()
         process.wait(10)
-    lines = log.read_text().splitlines()
-    assert lines[0] == "SETUP debug=False"
-    assert lines[1].startswith("cli.py: serving on 0.0.0.0:") and ", no password" in lines[1]
-    assert lines[2] == ("cli.py: warning: anyone who can reach this port may run cli.py commands here; "
-                        "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+    assert log.setup_debug() is False
+    assert log.host() == "0.0.0.0" and log.without_password()
+    assert log.warned_open()
 
 
 def test_connection_closed_before_the_handshake_is_no_refusal(server):
-    s = server()
-    before = s.log.read_text()
-    sock = socket.create_connection(("127.0.0.1", s.port), timeout=5)
-    sock.close()
-    deadline = time.monotonic() + 5
-    while "done" not in s.log.read_text()[len(before):] and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert "connection closed" not in s.log.read_text()[len(before):]  # that server does not log debug
-    loud = server(debug=True)
-    before = loud.log.read_text()
+    quiet, loud = server(), server(debug=True)
+    before = quiet.log.text
+    socket.create_connection(("127.0.0.1", quiet.port), timeout=5).close()
+    # Not a refusal: at the normal level the server says nothing at all.
+    time.sleep(0.5)
+    assert quiet.log.text == before
+    before = loud.log.text
     socket.create_connection(("127.0.0.1", loud.port), timeout=5).close()
-    deadline = time.monotonic() + 5
-    while "done" not in loud.log.read_text()[len(before):] and time.monotonic() < deadline:
-        time.sleep(0.05)
-    added = loud.log.read_text()[len(before):]
-    # The reason reads "connection closed" on Unix and names a WinError on Windows.
-    assert "connected" in added and "gone during the handshake: " in added and "done" in added
+    added = loud.log.wait(lambda text: Log.finished(text[len(before):]))[len(before):]
+    assert Log.connected(added) and Log.gone_in_handshake(added)
 
 
 def test_server_setup_hook_and_debug(server):
     """The program's setup gets the --debug flag; the server then logs each client."""
     quiet, loud = server(), server(debug=True)
-    assert quiet.setup_line == "SETUP debug=False" and loud.setup_line == "SETUP debug=True"
+    assert quiet.log.setup_debug() is False and loud.log.setup_debug() is True
     # With input, stdin is a pipe: the NUL device counts as a terminal on Windows.
     assert run(["foo", "x", "--remote", loud.target], input=b"")[:2] == (0, "foo name='x' count=1\n")
-    log = loud.log.read_text()
-    assert "connected" in log and "127.0.0.1 runs: foo x" in log and "done: exit 0 after" in log
-    assert "as: " in log and " foo x in " in log and "tty 000" in log
+    log = loud.log.text
+    assert Log.connected(log) and Log.ran(log, "foo x") and Log.exited(log, 0)
+    assert Log.launched(log, "foo x") and Log.terminal(log, "000")
     # The quiet server says the same at info, without the debug lines.
     run(["foo", "x", "--remote", quiet.target], input=b"")
-    quiet_log = quiet.log.read_text()
-    assert "127.0.0.1 runs: foo x" in quiet_log and "done: exit 0 after" in quiet_log
-    assert "connected" not in quiet_log and "as: " not in quiet_log
+    log = quiet.log.text
+    assert Log.ran(log, "foo x") and Log.exited(log, 0)
+    assert not Log.connected(log) and not Log.launched(log, "foo x")
 
 
 def test_server_listens_everywhere_by_default():
@@ -375,7 +450,7 @@ def test_denied(server, command):
     assert (code, out) == (2, "")
     assert err.startswith("cli.py: 127.0.0.1:") and "is not available remotely" in err
     denied = "server" if command.startswith("server") else "static"
-    assert f"cli.py: 127.0.0.1: '{denied}' is not available remotely" in server().log.read_text()
+    assert Log.refused(server().log.text, denied)
 
 
 def test_password(server):
@@ -389,8 +464,8 @@ def test_password(server):
 
 def test_password_given_to_a_server_without_one_is_warned_about(server):
     s = server()
-    assert "no password" in s.log.read_text().split("\n")[1]
-    assert "warning" not in s.log.read_text()  # it listens on loopback
+    assert s.log.without_password()
+    assert not s.log.warned_open()  # it listens on loopback
     code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
     assert (code, out) == (0, "foo name='x' count=1\n")
     assert err == f"warning: {s.target} asks for no password; the one given is not used\n"
@@ -461,11 +536,11 @@ def test_instant_no_route_everywhere_names_the_macos_permission(monkeypatch):
     monkeypatch.setattr(remote.sys, "platform", "darwin")
     with pytest.raises(remote.RemoteError) as e:
         remote.connect(remote.Target("r5", 4247, None), timeout=0.6)
-    assert str(e.value).startswith("cannot reach r5:4247: 192.168.1.5: No route to host\nthis is what macOS says")
+    assert "192.168.1.5: No route to host" in str(e.value) and "Local Network" in str(e.value)
     monkeypatch.setattr(remote.sys, "platform", "linux")
     with pytest.raises(remote.RemoteError) as e:
         remote.connect(remote.Target("r5", 4247, None), timeout=0.6)
-    assert "\n" not in str(e.value)
+    assert "Local Network" not in str(e.value)
 
 
 @pytest.mark.parametrize("pipes", [False, True])
@@ -503,11 +578,11 @@ def test_input_and_exit_code_between_kinds(server, pipes, client):
     if not pipes and not remote.HAS_PTY:
         pytest.skip("no server with terminals here")
     like = {"FIREAID_REMOTE_TEST_NO_PTY": client}
-    assert run(["cat", "--remote", s.target], "Probe", input=b"hello\n", **like) == (0, "hello\n", ""), s.log.read_text()
+    assert run(["cat", "--remote", s.target], "Probe", input=b"hello\n", **like) == (0, "hello\n", ""), s.log.text
     data = os.urandom(1 << 18).hex().encode()
     assert run(["cat", "--remote", s.target], "Probe", input=data, **like)[1] == data.decode()
     assert run(["fail", "--code", "7", "--remote", s.target], "Probe", **like)[0] == 7
-    assert run(["tty", "--remote", s.target], "Probe", input=b"", **like) == (0, "000 -\n", ""), s.log.read_text()
+    assert run(["tty", "--remote", s.target], "Probe", input=b"", **like) == (0, "000 -\n", ""), s.log.text
 
 
 def test_pipes_only_denied_and_password(server):
