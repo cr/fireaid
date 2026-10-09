@@ -174,6 +174,11 @@ Commands that must only run locally are named in a `fireaid.Remote`:
 The server refuses them, help for them included. `fireaid.Remote` also
 sets the default port, 4247, and the name of the variable.
 
+The server logs through the `fireaid.remote` logger: `Remote(setup=f)`
+names a function the server calls with its `--debug` flag before it
+starts, where the program sets up its own logging; without one, the
+server prints plain lines. `--debug` logs each client and its command.
+
 The server listens on all of the computer's addresses unless `--bind`
 names one. Without a password, anyone who can reach the port may run the
 program's commands, which is the normal state of affairs on a network of

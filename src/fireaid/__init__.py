@@ -247,12 +247,15 @@ class Remote:
     words, such as ``("firmware",)`` or ``("db drop",)``. ``port`` is the
     default port of server and client. ``env`` names the variable a
     client takes ``--remote`` from, by default the program's name in
-    capitals followed by ``_REMOTE``.
+    capitals followed by ``_REMOTE``. ``setup``, if given, is called with
+    the server's ``--debug`` flag before it starts, for the program to set
+    up its logging: the server logs through the ``fireaid.remote`` logger.
     """
 
     deny: tuple = ()
     port: int = 4247
     env: Any = None
+    setup: Any = None
 
 
 def _remote_config(remote: Any) -> Any:
@@ -270,16 +273,18 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
     """Make the server command, as a function and as a method."""
     port = remote.port
 
-    def server(port=port, password=None, bind="0.0.0.0"):
+    def server(port=port, password=None, bind="0.0.0.0", debug=False):
         module = importlib.import_module(__name__ + ".remote")
+        if remote.setup is not None:
+            remote.setup(bool(debug))
         try:
-            module.serve(launch, remote.deny, prog, variable, port, password, bind)
+            module.serve(launch, remote.deny, prog, variable, port, password, bind, bool(debug))
         except module.RemoteError as e:
             print(f"{prog}: {e}", file=sys.stderr)
             raise SystemExit(e.code) from None
 
-    def method(self, port=port, password=None, bind="0.0.0.0"):
-        return server(port, password, bind)
+    def method(self, port=port, password=None, bind="0.0.0.0", debug=False):
+        return server(port, password, bind, debug)
 
     local = ""
     if remote.deny:
@@ -304,9 +309,10 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
             password: The password clients must give; none by default.
             bind: The address to listen on: all of this computer's by default,
                 127.0.0.1 for clients on this computer only.
+            debug: Log each client, its command line and how it ended.
         """
     # Types for the help, as objects: this module's annotations are strings.
-    server.__annotations__ = {"port": int, "password": str, "bind": str}
+    server.__annotations__ = {"port": int, "password": str, "bind": str, "debug": bool}
     method.__annotations__ = dict(server.__annotations__)
     method.__name__ = server.__name__
     method.__doc__ = server.__doc__

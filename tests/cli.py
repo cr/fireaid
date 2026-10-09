@@ -159,6 +159,8 @@ if __name__ == "__main__":
 
             component, _ = fireaid._add_help(component)
         if os.environ.get("FIREAID_TEST_REMOTE"):
-            fire.Fire(component, remote=fire.Remote(deny=("static",)))
+            def setup(debug):
+                print(f"SETUP debug={debug}", file=sys.stderr, flush=True)
+            fire.Fire(component, remote=fire.Remote(deny=("static",), setup=setup))
         else:
             fire.Fire(component)

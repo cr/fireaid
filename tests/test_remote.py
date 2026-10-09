@@ -64,9 +64,10 @@ def run(argv, component="CLI", input=None, **variables):
 
 
 class Server:
-    def __init__(self, component, password, log, pipes=False):
+    def __init__(self, component, password, log, pipes=False, debug=False):
         # Loopback, so that no firewall asks about the tests.
         argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={PASSWORD}"] if password else [])
+        argv += ["--debug"] if debug else []
         self.log = log
         self.process = subprocess.Popen(
             [sys.executable, "cli.py", *argv],
@@ -81,7 +82,7 @@ class Server:
             assert self.process.poll() is None, log.read_text()
             assert time.monotonic() < deadline, "the server does not start"
             time.sleep(0.05)
-        first = log.read_text().split("\n")[0]
+        self.setup_line, first = log.read_text().split("\n")[:2]  # the program's setup hook ran first
         self.pipes = first.endswith(", commands get pipes")
         self.port = int(first.rsplit(":", 1)[1].split(",")[0])
         self.target = f"{PASSWORD}@127.0.0.1:{self.port}" if password else f"127.0.0.1:{self.port}"
@@ -96,10 +97,10 @@ def server(tmp_path_factory):
     """A server for a component, with or without a password, started once."""
     servers = {}
 
-    def server(component="CLI", password=False, pipes=False):
-        key = (component, password, pipes)
+    def server(component="CLI", password=False, pipes=False, debug=False):
+        key = (component, password, pipes, debug)
         if key not in servers:
-            servers[key] = Server(component, password, tmp_path_factory.mktemp("server") / "log", pipes)
+            servers[key] = Server(component, password, tmp_path_factory.mktemp("server") / "log", pipes, debug)
         return servers[key]
 
     yield server
@@ -215,9 +216,21 @@ def test_open_server_without_a_password_warns(tmp_path):
         process.terminate()
         process.wait(10)
     lines = log.read_text().splitlines()
-    assert lines[0].startswith("cli.py: serving on 0.0.0.0:") and lines[0].endswith(", no password")
-    assert lines[1] == ("cli.py: warning: anyone who can reach this port may run cli.py commands here; "
+    assert lines[0] == "SETUP debug=False"
+    assert lines[1].startswith("cli.py: serving on 0.0.0.0:") and lines[1].endswith(", no password")
+    assert lines[2] == ("cli.py: warning: anyone who can reach this port may run cli.py commands here; "
                         "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+
+
+def test_server_setup_hook_and_debug(server):
+    """The program's setup gets the --debug flag; the server then logs each client."""
+    quiet, loud = server(), server(debug=True)
+    assert quiet.setup_line == "SETUP debug=False" and loud.setup_line == "SETUP debug=True"
+    assert run(["foo", "x", "--remote", loud.target])[:2] == (0, "foo name='x' count=1\n")
+    log = loud.log.read_text()
+    assert "connected" in log and "runs 'foo x', tty 000" in log and "command exited 0, client gets 0" in log
+    run(["foo", "x", "--remote", quiet.target])
+    assert "connected" not in quiet.log.read_text()
 
 
 def test_server_listens_everywhere_by_default():
@@ -334,6 +347,8 @@ def test_denied(server, command):
     code, out, err = run([*command.split(), "--remote", server().target])
     assert (code, out) == (2, "")
     assert err.startswith("cli.py: 127.0.0.1:") and "is not available remotely" in err
+    denied = "server" if command.startswith("server") else "static"
+    assert f"cli.py: 127.0.0.1: '{denied}' is not available remotely" in server().log.read_text()
 
 
 def test_password(server):
@@ -347,7 +362,7 @@ def test_password(server):
 
 def test_password_given_to_a_server_without_one_is_warned_about(server):
     s = server()
-    assert "no password" in s.log.read_text().split("\n")[0]
+    assert "no password" in s.log.read_text().split("\n")[1]
     assert "warning" not in s.log.read_text()  # it listens on loopback
     code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
     assert (code, out) == (0, "foo name='x' count=1\n")

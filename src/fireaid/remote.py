@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import queue
 import secrets
@@ -42,6 +43,8 @@ except ImportError:  # Windows
 
 # Whether this system has pseudo-terminals for the commands a server runs.
 HAS_PTY = termios is not None and hasattr(os, "openpty")
+
+logger = logging.getLogger("fireaid.remote")
 
 PROTOCOL = 1
 FLAG = "--remote"
@@ -403,9 +406,29 @@ def _watch(selector: selectors.BaseSelector, fileobj: Any, events: int) -> None:
 # -- The server
 
 
+class _PlainFormatter(logging.Formatter):
+    """Log lines as a command-line tool prints them: ``prog: warning: ...``."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__("%(message)s")
+        self.prog = prog
+
+    def format(self, record: logging.LogRecord) -> str:
+        level = f"{record.levelname.lower()}: " if record.levelno >= logging.WARNING else ""
+        return f"{self.prog}: {level}{super().format(record)}"
+
+
 def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: Any, password: Any,
-          bind: Any = "0.0.0.0") -> None:
-    """Run the server until interrupted."""
+          bind: Any = "0.0.0.0", debug: bool = False) -> None:
+    """Run the server until interrupted.
+
+    It logs through the ``fireaid.remote`` logger. A program that has not
+    set up logging gets plain lines on stderr.
+    """
+    if not logging.getLogger().handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(_PlainFormatter(prog))
+        logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, handlers=[handler])
     if launch.error:
         raise RemoteError(launch.error)
     if isinstance(password, bool) or not isinstance(password, (str, int, type(None))):
@@ -433,11 +456,11 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
     handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
     notes = "" if password is not None else ", no password"
     notes += "" if _pty_available() else ", commands get pipes"
-    print(f"{prog}: serving on {host}:{listener.getsockname()[1]}{notes}", file=sys.stderr, flush=True)
+    logger.info(f"serving on {host}:{listener.getsockname()[1]}{notes}")
     if password is None and not host.startswith("127."):
-        print(f"{prog}: warning: anyone who can reach this port may run {prog} commands here; "
-              "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer",
-              file=sys.stderr, flush=True)
+        logger.warning(f"anyone who can reach this port may run {prog} commands here; "
+                       "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+    logger.debug(f"starting {' '.join(launch.prefix)} in {launch.cwd} for each command")
     listener.settimeout(1.0)  # so that Ctrl-C gets through on Windows
     try:
         while True:
@@ -445,12 +468,14 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
                 sock, peer = listener.accept()
             except socket.timeout:
                 continue
+            logger.debug(f"{peer[0]}:{peer[1]} connected")
             try:
                 _Session(sock, launch, deny, prog, variable, password).run()
             except Exception as e:  # one client must not stop the server
-                print(f"{prog}: {peer[0]}: {e}", file=sys.stderr, flush=True)
+                logger.error(f"{peer[0]}: {e}")
             finally:
                 sock.close()
+                logger.debug(f"{peer[0]}:{peer[1]} done")
     except KeyboardInterrupt:
         pass
     finally:
@@ -480,16 +505,19 @@ class _Session:
         except _ProtocolError as e:
             self.refuse(str(e), 2)
             return
-        except (socket.timeout, ConnectionError):
+        except (socket.timeout, ConnectionError) as e:
+            logger.debug(f"{self.peer}: gone during the handshake: {e}")
             return
         if request is None:
             return
+        tty = "".join("1" if x else "0" for x in request["tty"])
+        logger.debug(f"{self.peer} runs {' '.join(request['argv'])!r}, tty {tty}, size {request.get('size')}")
         sock.setblocking(False)
         runner = _Command if _pty_available() else _PipeCommand
         runner(self.channel, self.launch, request, self.variable).run()
 
     def refuse(self, message: str, code: int) -> None:
-        print(f"{self.prog}: {self.peer}: {message}", file=sys.stderr, flush=True)
+        logger.info(f"{self.peer}: {message}")
         try:
             self.channel.write(REFUSED, {"message": message, "code": code})
         except OSError:
@@ -568,6 +596,7 @@ def _kill(process: subprocess.Popen | None) -> None:
     """End the command, and what it started, as its client has gone."""
     if process is None or process.poll() is not None:
         return
+    logger.debug("client gone, ending the command")
     if os.name == "nt":
         steps = ((process.terminate, 2.0), (process.kill, None))
     else:
@@ -586,6 +615,7 @@ def _kill(process: subprocess.Popen | None) -> None:
 
 
 def _send_exit(channel: _Channel, returncode: int) -> None:
+    logger.debug(f"command exited {returncode}, client gets {_exit_code(returncode)}")
     channel.queue(EXIT, {"code": _exit_code(returncode)})
     sock = channel.sock
     sock.setblocking(True)
