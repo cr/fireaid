@@ -80,6 +80,13 @@ help for it.
 To that end, fireaid adds the command to the program for as long as
 Fire runs: to its class, or to a copy if the program is a dict.
 
+A program that is a class, as in `fire.Fire(MyTool)`, gets the help of
+an instance. Fire does not instantiate a class to show its help, and so
+lists only the flags of its constructor. fireaid instantiates it, without
+arguments, and lists its groups, commands and values, with the
+constructor's flags among them. A class whose constructor needs
+arguments keeps Fire's help.
+
 With `--help` and `-h`, fireaid also
 
 - prints the help text to stdout, so that `tool --help | less` works,
@@ -109,6 +116,10 @@ Fire's exit code for errors:
 A function that returns an object is a complete command. There, Fire
 shows the help for the object, which fireaid only keeps from the pager.
 
+For a program that is a class with constructor flags, Fire's usage reads
+`tool - <group|command>`, the `-` standing in for the flags. Since the
+flags may come anywhere, fireaid leaves it out.
+
 ## Colour
 
 On a terminal, fireaid colours the usage text and the help it prints:
@@ -122,6 +133,52 @@ Fire makes it.
 `examples/pantry.py` is a small program to try all of this on, and
 `examples/tour.sh` runs through it.
 
+`examples/progress.py` is a template for a tool that does longer work:
+log lines in colour and a progress bar on a terminal, plain lines
+everywhere else, drawn by [rich](https://pypi.org/project/rich/).
+
+## Remote control
+
+A program can be run on another computer, such as the one its hardware
+is plugged into:
+
+    fire.Fire(MyTool, remote=True)
+
+adds a `server` command, which serves the program's commands:
+
+    tool server
+    tool server --port 4247 --password secret
+
+and a `--remote [PASSWORD@]HOST[:PORT]` flag, which runs a command line
+on such a server, anywhere on the command line before a `--`:
+
+    tool --remote secret@boat get battery
+    tool get battery --remote secret@boat
+
+The variable `TOOL_REMOTE`, named after the program, gives a default for
+the flag, and `--remote=` runs a command locally all the same.
+
+Each command runs in a new process of the program on the server, as if
+typed there, and its output, input and exit code are relayed. Where the
+client has a terminal, the command gets one of the same size, so that
+colour, progress bars, line width, prompts and Ctrl-C work as they do
+locally; where the client has a pipe or a file, the command gets a pipe.
+The client's `TERM`, `NO_COLOR`, `FORCE_COLOR`, `COLUMNS`, locale and
+pager settings go along.
+
+Commands that must only run locally are named in a `fireaid.Remote`:
+
+    fire.Fire(MyTool, remote=fire.Remote(deny=("firmware",)))
+
+The server refuses them, help for them included. `fireaid.Remote` also
+sets the default port, 4247, and the name of the variable.
+
+Without a password, the server only accepts connections from its own
+computer. With one, it accepts them from anywhere, and the client must
+know the password, which itself never crosses the network. The
+connection is not encrypted, so keep it to a network you trust. The
+server serves one client at a time. Remote control needs a Unix system.
+
 ## Limits
 
 fireaid does not take anything away from the wrapped program:
@@ -134,6 +191,9 @@ fireaid does not take anything away from the wrapped program:
 - A command that fireaid cannot find without running the program, such
   as a member created in `__init__`, may have such a parameter. There,
   `-h` is left to Fire, which shows help with its banner on stderr.
+- With `remote=True`, `--remote` belongs to fireaid on every command
+  line, and is not listed in the help for each command. `tool help
+  server` describes it.
 
 Help for a command that does not exist is an error, as it is in
 Fire's native syntax.

@@ -19,7 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "pytest"
+    "pytest",
+    "rich"  # for examples/progress.py
 ]
 
 [project.urls]

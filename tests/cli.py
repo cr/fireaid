@@ -5,9 +5,13 @@ FIREAID_TEST_MODULE selects fire or fireaid, FIREAID_TEST_COMPONENT the
 component passed to Fire(), NONE standing for no component at all.
 FIREAID_TEST_HELP gives the component fireaid's help command up front,
 to see what Fire makes of it as a command like any other.
+FIREAID_TEST_REMOTE makes it a remote-controlled program, whose group
+static only runs locally.
 """
 
 import os
+import sys
+import time
 
 fire = __import__(os.environ.get("FIREAID_TEST_MODULE", "fireaid"))
 
@@ -72,6 +76,67 @@ def make():
     return Sub()
 
 
+class Probe(CLI):
+    """Commands that show what a command line runs in."""
+
+    def tty(self):
+        """Which of stdin, stdout and stderr are terminals, and the size."""
+        flags = "".join("1" if os.isatty(fd) else "0" for fd in (0, 1, 2))
+        try:
+            columns, lines = os.get_terminal_size(next(fd for fd in (1, 2, 0) if os.isatty(fd)))
+            size = f"{columns}x{lines}"
+        except (StopIteration, OSError):
+            size = "-"
+        return f"{flags} {size}"
+
+    def env(self, *names):
+        """Environment variables."""
+        return " ".join(f"{name}={os.environ.get(name, '-')}" for name in names)
+
+    def cat(self):
+        """Copy stdin to stdout."""
+        sys.stdout.write(sys.stdin.read())
+
+    def fail(self, code=3):
+        """Exit with a code."""
+        sys.exit(code)
+
+    def color(self):
+        """Red on stderr where it is a terminal."""
+        print("\x1b[31mred\x1b[0m" if os.isatty(2) else "plain", file=sys.stderr)
+        return "result"
+
+    def interleave(self, lines=500):
+        """Alternate lines on stdout and stderr."""
+        for i in range(lines):
+            print(i, file=(sys.stdout, sys.stderr)[i % 2], flush=True)
+
+    def sleep(self, seconds=30):
+        """Sleep."""
+        print("started", flush=True)
+        time.sleep(seconds)
+        return "slept"
+
+
+class Configured(CLI):
+    """Configured doc."""
+
+    def __init__(self, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+
+
+class Needy:
+    """Needy doc."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def go(self):
+        """Go doc."""
+        return self.path
+
+
 DICT = {"foo": CLI().foo, "help": lambda: "own help"}
 
 INSTANCE = CLI()
@@ -87,4 +152,7 @@ if __name__ == "__main__":
             import fireaid
 
             component, _ = fireaid._add_help(component)
-        fire.Fire(component)
+        if os.environ.get("FIREAID_TEST_REMOTE"):
+            fire.Fire(component, remote=fire.Remote(deny=("static",)))
+        else:
+            fire.Fire(component)

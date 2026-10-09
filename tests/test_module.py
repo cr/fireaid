@@ -23,7 +23,12 @@ def test_fire_is_wrapped():
     assert fireaid.Fire is not fire.Fire
     assert fireaid.Fire.__wrapped__ is fire.Fire
     assert fireaid.Fire.__doc__ == fire.Fire.__doc__
-    assert inspect.signature(fireaid.Fire) == inspect.signature(fire.Fire)
+    ours = inspect.signature(fireaid.Fire).parameters
+    theirs = inspect.signature(fire.Fire).parameters
+    # Fire's parameters, and remote, which is fireaid's.
+    assert list(ours.values())[:-1] == list(theirs.values())
+    assert ours["remote"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert ours["remote"].default is False
 
 
 def test_attributes_are_fires():
