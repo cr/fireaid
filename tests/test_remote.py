@@ -250,9 +250,13 @@ def test_server_setup_hook_and_debug(server):
     # With input, stdin is a pipe: the NUL device counts as a terminal on Windows.
     assert run(["foo", "x", "--remote", loud.target], input=b"")[:2] == (0, "foo name='x' count=1\n")
     log = loud.log.read_text()
-    assert "connected" in log and "runs 'foo x', tty 000" in log and "command exited 0, client gets 0" in log
-    run(["foo", "x", "--remote", quiet.target])
-    assert "connected" not in quiet.log.read_text()
+    assert "connected" in log and "127.0.0.1 runs: foo x" in log and "done: exit 0 after" in log
+    assert "as: " in log and " foo x in " in log and "tty 000" in log
+    # The quiet server says the same at info, without the debug lines.
+    run(["foo", "x", "--remote", quiet.target], input=b"")
+    quiet_log = quiet.log.read_text()
+    assert "127.0.0.1 runs: foo x" in quiet_log and "done: exit 0 after" in quiet_log
+    assert "connected" not in quiet_log and "as: " not in quiet_log
 
 
 def test_server_listens_everywhere_by_default():

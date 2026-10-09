@@ -24,6 +24,7 @@ import queue
 import secrets
 import select
 import selectors
+import shlex
 import signal
 import socket
 import struct
@@ -513,11 +514,20 @@ class _Session:
             return
         if request is None:
             return
+        argv = request["argv"]
         tty = "".join("1" if x else "0" for x in request["tty"])
-        logger.debug(f"{self.peer} runs {' '.join(request['argv'])!r}, tty {tty}, size {request.get('size')}")
+        logger.info(f"{self.peer} runs: {shlex.join(argv)}")
+        logger.debug(f"as: {shlex.join([*self.launch.prefix, *argv])} in {self.launch.cwd}; "
+                     f"tty {tty}, size {request.get('size')}, env {request['env']}")
         sock.setblocking(False)
         runner = _Command if _pty_available() else _PipeCommand
-        runner(self.channel, self.launch, request, self.variable).run()
+        started = time.monotonic()
+        code = runner(self.channel, self.launch, request, self.variable).run()
+        seconds = time.monotonic() - started
+        if code is None:
+            logger.info(f"{self.peer} went away after {seconds:.1f} s; the command was ended")
+        else:
+            logger.info(f"{self.peer} done: exit {code} after {seconds:.1f} s")
 
     def refuse(self, message: str, code: int) -> None:
         logger.info(f"{self.peer}: {message}")
@@ -617,9 +627,12 @@ def _kill(process: subprocess.Popen | None) -> None:
             pass
 
 
-def _send_exit(channel: _Channel, returncode: int) -> None:
-    logger.debug(f"command exited {returncode}, client gets {_exit_code(returncode)}")
-    channel.queue(EXIT, {"code": _exit_code(returncode)})
+def _send_exit(channel: _Channel, returncode: int) -> int:
+    """Send the command's exit code to the client, and return it."""
+    code = _exit_code(returncode)
+    if code != returncode:
+        logger.debug(f"command returned {returncode}, client gets {code}")
+    channel.queue(EXIT, {"code": code})
     sock = channel.sock
     sock.setblocking(True)
     sock.settimeout(_HANDSHAKE_TIMEOUT)
@@ -627,6 +640,7 @@ def _send_exit(channel: _Channel, returncode: int) -> None:
         sock.sendall(channel.outgoing)
     except OSError:
         pass
+    return code
 
 
 def _take_terminal() -> None:
@@ -729,8 +743,8 @@ class _Command:
                 os.close(fd)
         if gone:
             self.kill()
-            return
-        _send_exit(self.channel, self.process.wait())
+            return None
+        return _send_exit(self.channel, self.process.wait())
 
     def kill(self) -> None:
         _kill(self.process)
@@ -901,8 +915,8 @@ class _PipeCommand:
             self.input.put(None)
         if gone:
             _kill(self.process)
-            return
-        _send_exit(self.channel, self.process.wait())
+            return None
+        return _send_exit(self.channel, self.process.wait())
 
     def relay(self) -> bool:
         """Relay until the command is done. Returns whether the client went away."""
