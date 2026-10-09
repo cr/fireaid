@@ -270,16 +270,16 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
     """Make the server command, as a function and as a method."""
     port = remote.port
 
-    def server(port=port, password=None):
+    def server(port=port, password=None, bind="0.0.0.0"):
         module = importlib.import_module(__name__ + ".remote")
         try:
-            module.serve(launch, remote.deny, prog, variable, port, password)
+            module.serve(launch, remote.deny, prog, variable, port, password, bind)
         except module.RemoteError as e:
             print(f"{prog}: {e}", file=sys.stderr)
             raise SystemExit(e.code) from None
 
-    def method(self, port=port, password=None):
-        return server(port, password)
+    def method(self, port=port, password=None, bind="0.0.0.0"):
+        return server(port, password, bind)
 
     local = ""
     if remote.deny:
@@ -289,8 +289,9 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
 
         A client runs a command here by adding --remote [PASSWORD@]HOST[:PORT]
         anywhere on its command line, or by setting {variable}. An empty
-        --remote= runs the command locally. The connection is authenticated,
-        but not encrypted.
+        --remote= runs the command locally. Without a password, anyone who
+        can reach the port may run commands; with one, the connection is
+        authenticated. It is not encrypted either way.
 
         Each command runs in a new process of this program, as if typed
         here. Its output, input and exit code are relayed, and it sees a
@@ -300,11 +301,12 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
 
         Args:
             port: The TCP port to listen on, 0 for any free one.
-            password: The password clients must give. Without one, only
-                clients on this computer can connect.
+            password: The password clients must give; none by default.
+            bind: The address to listen on: all of this computer's by default,
+                127.0.0.1 for clients on this computer only.
         """
     # Types for the help, as objects: this module's annotations are strings.
-    server.__annotations__ = {"port": int, "password": str}
+    server.__annotations__ = {"port": int, "password": str, "bind": str}
     method.__annotations__ = dict(server.__annotations__)
     method.__name__ = server.__name__
     method.__doc__ = server.__doc__

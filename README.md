@@ -148,6 +148,7 @@ adds a `server` command, which serves the program's commands:
 
     tool server
     tool server --port 4247 --password secret
+    tool server --bind 127.0.0.1
 
 and a `--remote [PASSWORD@]HOST[:PORT]` flag, which runs a command line
 on such a server, anywhere on the command line before a `--`:
@@ -173,11 +174,12 @@ Commands that must only run locally are named in a `fireaid.Remote`:
 The server refuses them, help for them included. `fireaid.Remote` also
 sets the default port, 4247, and the name of the variable.
 
-Without a password, the server only accepts connections from its own
-computer. With one, it accepts them from anywhere, and the client must
-know the password, which itself never crosses the network. The
-connection is not encrypted, so keep it to a network you trust. The
-server serves one client at a time.
+The server listens on all of the computer's addresses unless `--bind`
+names one. Without a password, anyone who can reach the port may run the
+program's commands, which is the normal state of affairs on a network of
+one's own; the server says so once when it starts. With a password,
+clients must know it; it never crosses the network. The connection is not encrypted either way. The server serves
+one client at a time.
 
 A server on Windows, which has no pseudo-terminals, gives every command
 pipes: the command behaves as if its output were redirected, and Ctrl-C

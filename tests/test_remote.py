@@ -7,6 +7,7 @@ FIREAID_REMOTE_TEST_NO_PTY makes a server or client anywhere behave like
 one on Windows, so that the two kinds are tested against each other.
 """
 
+import inspect
 import os
 import signal
 import subprocess
@@ -64,15 +65,15 @@ def run(argv, component="CLI", input=None, **variables):
 
 class Server:
     def __init__(self, component, password, log, pipes=False):
-        argv = ["server", "--port", "0"] + ([f"--password={PASSWORD}"] if password else [])
+        # Loopback, so that no firewall asks about the tests.
+        argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={PASSWORD}"] if password else [])
         self.log = log
         self.process = subprocess.Popen(
             [sys.executable, "cli.py", *argv],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=log.open("w"),
-            env=environment(component, FIREAID_REMOTE_TEST_BIND="127.0.0.1",
-                            FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else ""),
+            env=environment(component, FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else ""),
             cwd=TESTS,
         )
         deadline = time.monotonic() + 10
@@ -199,9 +200,34 @@ def test_refusal(command, refused):
     assert (remote.refusal(command.split(), ["firmware", "db drop"]) is not None) == refused
 
 
-def test_password_opens_the_server_to_the_network():
-    assert remote.bind_address(None) == "127.0.0.1"
-    assert remote.bind_address("x") == "0.0.0.0"
+def test_open_server_without_a_password_warns(tmp_path):
+    log = tmp_path / "log"
+    process = subprocess.Popen(
+        [sys.executable, "cli.py", "server", "--port", "0"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log.open("w"),
+        env=environment("INSTANCE"), cwd=TESTS,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while "warning" not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        process.terminate()
+        process.wait(10)
+    lines = log.read_text().splitlines()
+    assert lines[0].startswith("cli.py: serving on 0.0.0.0:") and lines[0].endswith(", no password")
+    assert lines[1] == ("cli.py: warning: anyone who can reach this port may run cli.py commands here; "
+                        "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+
+
+def test_server_listens_everywhere_by_default():
+    """--bind narrows it; a password does not change where it listens."""
+    command = fireaid._server_command(fireaid.Remote(), "t", "T", None)[0]
+    parameters = inspect.signature(command).parameters
+    assert parameters["bind"].default == "0.0.0.0"
+    assert parameters["password"].default is None
+    out = run(["help", "server"], "INSTANCE")[1]
+    assert "--bind=BIND" in out and "all of this computer's by default" in out
 
 
 # -- What Fire() makes of remote=
@@ -317,6 +343,15 @@ def test_password(server):
         code, out, err = run(["foo", "x", "--remote", target])
         assert (code, out) == (1, "")
         assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
+
+
+def test_password_given_to_a_server_without_one_is_warned_about(server):
+    s = server()
+    assert "no password" in s.log.read_text().split("\n")[0]
+    assert "warning" not in s.log.read_text()  # it listens on loopback
+    code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
+    assert (code, out) == (0, "foo name='x' count=1\n")
+    assert err == f"warning: {s.target} asks for no password; the one given is not used\n"
 
 
 def test_unreachable():

@@ -49,10 +49,6 @@ FLAG = "--remote"
 # Set in the environment of every command the server runs.
 CHILD_VARIABLE = "FIREAID_REMOTE_CHILD"
 
-# Binds the server to this address instead of the one the password
-# selects. For the tests, which must not trigger a firewall dialog.
-_TEST_BIND_VARIABLE = "FIREAID_REMOTE_TEST_BIND"
-
 # Makes server and client behave as on Windows: the server gives commands
 # pipes, the client leaves its terminal alone and reads it in a thread.
 _TEST_NO_PTY_VARIABLE = "FIREAID_REMOTE_TEST_NO_PTY"
@@ -278,11 +274,6 @@ class Launch:
         return cls((sys.executable, script), cwd)
 
 
-def bind_address(password: str | None) -> str:
-    """Without a password, only this computer may connect."""
-    return "0.0.0.0" if password is not None else "127.0.0.1"
-
-
 # -- Framing
 
 
@@ -412,7 +403,8 @@ def _watch(selector: selectors.BaseSelector, fileobj: Any, events: int) -> None:
 # -- The server
 
 
-def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: Any, password: Any) -> None:
+def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: Any, password: Any,
+          bind: Any = "0.0.0.0") -> None:
     """Run the server until interrupted."""
     if launch.error:
         raise RemoteError(launch.error)
@@ -423,7 +415,9 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536:
         raise RemoteError(f"{port!r} is not a port", 2)
 
-    host = os.environ.get(_TEST_BIND_VARIABLE) or bind_address(password)
+    if not isinstance(bind, str) or not bind:
+        raise RemoteError(f"{bind!r} is not an address to bind to", 2)
+    host = bind
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -437,8 +431,13 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
         raise SystemExit(0)
 
     handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
-    terminals = "" if _pty_available() else ", commands get pipes"
-    print(f"{prog}: serving on {host}:{listener.getsockname()[1]}{terminals}", file=sys.stderr, flush=True)
+    notes = "" if password is not None else ", no password"
+    notes += "" if _pty_available() else ", commands get pipes"
+    print(f"{prog}: serving on {host}:{listener.getsockname()[1]}{notes}", file=sys.stderr, flush=True)
+    if password is None and not host.startswith("127."):
+        print(f"{prog}: warning: anyone who can reach this port may run {prog} commands here; "
+              "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer",
+              file=sys.stderr, flush=True)
     listener.settimeout(1.0)  # so that Ctrl-C gets through on Windows
     try:
         while True:
@@ -1047,6 +1046,9 @@ class _Client:
             except (TypeError, ValueError):
                 raise _ProtocolError("bad challenge") from None
             channel.write(AUTH, {"mac": _mac(self.target.password or "", nonce)})
+        elif self.target.password is not None:
+            print(f"warning: {self.target} asks for no password; the one given is not used", file=sys.stderr,
+                  flush=True)
         kind, payload = channel.read()
         if kind == REFUSED:
             self.refused(payload)
