@@ -7,9 +7,11 @@ FIREAID_REMOTE_TEST_NO_PTY makes a server or client anywhere behave like
 one on Windows, so that the two kinds are tested against each other.
 """
 
+import errno
 import inspect
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -217,16 +219,36 @@ def test_open_server_without_a_password_warns(tmp_path):
         process.wait(10)
     lines = log.read_text().splitlines()
     assert lines[0] == "SETUP debug=False"
-    assert lines[1].startswith("cli.py: serving on 0.0.0.0:") and lines[1].endswith(", no password")
+    assert lines[1].startswith("cli.py: serving on 0.0.0.0:") and ", no password" in lines[1]
     assert lines[2] == ("cli.py: warning: anyone who can reach this port may run cli.py commands here; "
                         "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+
+
+def test_connection_closed_before_the_handshake_is_no_refusal(server):
+    s = server()
+    before = s.log.read_text()
+    sock = socket.create_connection(("127.0.0.1", s.port), timeout=5)
+    sock.close()
+    deadline = time.monotonic() + 5
+    while "done" not in s.log.read_text()[len(before):] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "connection closed" not in s.log.read_text()[len(before):]  # that server does not log debug
+    loud = server(debug=True)
+    before = loud.log.read_text()
+    socket.create_connection(("127.0.0.1", loud.port), timeout=5).close()
+    deadline = time.monotonic() + 5
+    while "done" not in loud.log.read_text()[len(before):] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    added = loud.log.read_text()[len(before):]
+    assert "connected" in added and "gone during the handshake: connection closed" in added and "done" in added
 
 
 def test_server_setup_hook_and_debug(server):
     """The program's setup gets the --debug flag; the server then logs each client."""
     quiet, loud = server(), server(debug=True)
     assert quiet.setup_line == "SETUP debug=False" and loud.setup_line == "SETUP debug=True"
-    assert run(["foo", "x", "--remote", loud.target])[:2] == (0, "foo name='x' count=1\n")
+    # With input, stdin is a pipe: the NUL device counts as a terminal on Windows.
+    assert run(["foo", "x", "--remote", loud.target], input=b"")[:2] == (0, "foo name='x' count=1\n")
     log = loud.log.read_text()
     assert "connected" in log and "runs 'foo x', tty 000" in log and "command exited 0, client gets 0" in log
     run(["foo", "x", "--remote", quiet.target])
@@ -372,7 +394,73 @@ def test_password_given_to_a_server_without_one_is_warned_about(server):
 def test_unreachable():
     code, out, err = run(["foo", "x", "--remote", "127.0.0.1:1"])
     assert code == 1
-    assert err.startswith("cli.py: cannot reach 127.0.0.1:1:")
+    assert err.startswith("cli.py: cannot reach 127.0.0.1:1: 127.0.0.1: ")
+
+
+def test_connect_retries_transient_errors_and_names_each_address(monkeypatch):
+    attempts = []
+
+    class Sock:
+        def __init__(self, family, kind, proto):
+            self.family = family
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, address):
+            attempts.append(address[0])
+            if self.family == socket.AF_INET6:
+                raise OSError(errno.ENETUNREACH, "No route to host")
+            if len([a for a in attempts if a == address[0]]) < 2:
+                raise OSError(errno.EHOSTUNREACH, "No route to host")  # ARP still pending
+
+        def close(self):
+            pass
+
+    found = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00::5", 4247, 0, 0)),
+             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.5", 4247))]
+    monkeypatch.setattr(remote.socket, "getaddrinfo", lambda *a, **k: found)
+    monkeypatch.setattr(remote.socket, "socket", Sock)
+    monkeypatch.setattr(remote.time, "sleep", lambda s: None)
+    sock = remote.connect(remote.Target("r5", 4247, None), timeout=5)
+    assert isinstance(sock, Sock) and sock.family == socket.AF_INET
+    assert attempts == ["fd00::5", "192.168.1.5", "fd00::5", "192.168.1.5"]
+
+    def refused(self, address):
+        raise OSError(errno.ECONNREFUSED, "Connection refused")
+
+    monkeypatch.setattr(Sock, "connect", refused)
+    with pytest.raises(remote.RemoteError) as e:
+        remote.connect(remote.Target("r5", 4247, None), timeout=5)
+    assert str(e.value) == ("cannot reach r5:4247: [fd00::5]: Connection refused; 192.168.1.5: Connection refused")
+
+
+def test_instant_no_route_everywhere_names_the_macos_permission(monkeypatch):
+    class Sock:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, address):
+            raise OSError(errno.EHOSTUNREACH, "No route to host")
+
+        def close(self):
+            pass
+
+    found = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.5", 4247))]
+    monkeypatch.setattr(remote.socket, "getaddrinfo", lambda *a, **k: found)
+    monkeypatch.setattr(remote.socket, "socket", Sock)
+    monkeypatch.setattr(remote.time, "sleep", lambda s: None)
+    monkeypatch.setattr(remote.sys, "platform", "darwin")
+    with pytest.raises(remote.RemoteError) as e:
+        remote.connect(remote.Target("r5", 4247, None), timeout=0.6)
+    assert str(e.value).startswith("cannot reach r5:4247: 192.168.1.5: No route to host\nthis is what macOS says")
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    with pytest.raises(remote.RemoteError) as e:
+        remote.connect(remote.Target("r5", 4247, None), timeout=0.6)
+    assert "\n" not in str(e.value)
 
 
 @pytest.mark.parametrize("pipes", [False, True])

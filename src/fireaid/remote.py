@@ -14,6 +14,7 @@ Imported by fireaid when a program asks for it.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -86,6 +87,8 @@ _SIGNALS = {name: getattr(signal, "SIG" + name) for name in ("INT", "TERM", "HUP
 _CONTROL_C_EXIT = 0xC000013A  # how Windows reports a process ended by Ctrl-Break
 
 _CONNECT_TIMEOUT = 5.0
+# Errors a fresh LAN neighbour gives for a moment, while its address is being resolved.
+_TRANSIENT = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.EADDRNOTAVAIL}
 _HANDSHAKE_TIMEOUT = 10.0
 _TICK = 0.2
 
@@ -331,7 +334,7 @@ class _Channel:
                 return message
             data = self.sock.recv(_CHUNK)
             if not data:
-                raise _ProtocolError("connection closed")
+                raise EOFError("connection closed")
             self.incoming += data
 
     def expect(self, kind: int) -> bytes:
@@ -505,7 +508,7 @@ class _Session:
         except _ProtocolError as e:
             self.refuse(str(e), 2)
             return
-        except (socket.timeout, ConnectionError) as e:
+        except (socket.timeout, ConnectionError, EOFError) as e:
             logger.debug(f"{self.peer}: gone during the handshake: {e}")
             return
         if request is None:
@@ -965,12 +968,56 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def connect(target: Target, timeout: float = _CONNECT_TIMEOUT) -> socket.socket:
+    """
+    A connection to the target, trying each of its addresses.
+
+    "No route to host" and its kin come and go while the network is still
+    finding a neighbour's hardware address, so those are retried within the
+    timeout. The error names every address and what went wrong with it.
+    """
+    try:
+        found = socket.getaddrinfo(target.host, target.port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise RemoteError(f"cannot reach {target}: {e.strerror or e}") from None
+    deadline = time.monotonic() + timeout
+    errors: dict[str, str] = {}
+    instant_unreachable = True  # every attempt failed with "no route" at once
+    while True:
+        transient = False
+        for family, kind, proto, _, address in found:
+            shown = f"[{address[0]}]" if family == socket.AF_INET6 else address[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock = socket.socket(family, kind, proto)
+            started = time.monotonic()
+            try:
+                sock.settimeout(remaining)
+                sock.connect(address)
+                return sock
+            except OSError as e:
+                sock.close()
+                errors[shown] = e.strerror or str(e)
+                number = getattr(e, "errno", None)
+                transient |= number in _TRANSIENT
+                instant_unreachable &= number == errno.EHOSTUNREACH and time.monotonic() - started < 0.05
+        if not transient or time.monotonic() + 0.5 > deadline:
+            break
+        time.sleep(0.5)
+    tried = "; ".join(f"{address}: {error}" for address, error in errors.items()) or "no address"
+    hint = ""
+    if errors and instant_unreachable and sys.platform == "darwin":
+        # macOS answers at once with "No route to host" for a program that
+        # may not use the local network, while ping still gets through.
+        hint = ("\nthis is what macOS says when the app running this has no Local Network permission: "
+                "System Settings > Privacy & Security > Local Network")
+    raise RemoteError(f"cannot reach {target}: {tried}{hint}")
+
+
 def run_client(target: Target, argv: Sequence[str]) -> int:
     """Run a command line on a server. Returns its exit code."""
-    try:
-        sock = socket.create_connection((target.host, target.port), timeout=_CONNECT_TIMEOUT)
-    except OSError as e:
-        raise RemoteError(f"cannot reach {target}: {e.strerror or e}") from None
+    sock = connect(target)
     try:
         return _Client(sock, target).run(list(argv))
     finally:
@@ -1003,7 +1050,7 @@ class _Client:
             self.handshake(argv)
         except socket.timeout:
             raise RemoteError(f"{self.target} does not answer") from None
-        except (_ProtocolError, ConnectionError) as e:
+        except (_ProtocolError, ConnectionError, EOFError) as e:
             raise RemoteError(f"{self.target}: {e}") from None
 
         flags = [os.isatty(fd) for fd in (0, 1, 2)]

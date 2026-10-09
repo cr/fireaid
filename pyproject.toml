@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fireaid"
-version = "0.3.0dev2"
+version = "0.3.0dev3"
 description = "Familiar help for command-line tools made with Python Fire"
 readme = "README.md"
 requires-python = ">=3.9"
