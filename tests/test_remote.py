@@ -3,19 +3,24 @@ Remote control: a command line run through a server behaves as it does
 locally, and the server runs only what it may.
 """
 
-import fcntl
 import os
-import pty
 import signal
-import struct
 import subprocess
 import sys
-import termios
 import time
 from pathlib import Path
 
 import fireaid
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("remote control needs a Unix system", allow_module_level=True)
+
+import fcntl
+import pty
+import struct
+import termios
+
 from fireaid import remote
 
 TESTS = Path(__file__).parent

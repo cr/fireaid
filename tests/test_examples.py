@@ -12,6 +12,7 @@ import pytest
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the tour is a shell script")
 def test_tour():
     completed = subprocess.run(
         ["sh", str(EXAMPLES / "tour.sh")],
