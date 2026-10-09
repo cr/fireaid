@@ -240,7 +240,8 @@ def test_connection_closed_before_the_handshake_is_no_refusal(server):
     while "done" not in loud.log.read_text()[len(before):] and time.monotonic() < deadline:
         time.sleep(0.05)
     added = loud.log.read_text()[len(before):]
-    assert "connected" in added and "gone during the handshake: connection closed" in added and "done" in added
+    # The reason reads "connection closed" on Unix and names a WinError on Windows.
+    assert "connected" in added and "gone during the handshake: " in added and "done" in added
 
 
 def test_server_setup_hook_and_debug(server):
