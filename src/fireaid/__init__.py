@@ -483,11 +483,12 @@ class _HelpText:
     left alone: the command was complete.
     """
 
-    def __init__(self, color_usage: bool, color_help: bool, conventional: bool) -> None:
+    def __init__(self, color_usage: bool, color_help: bool, conventional: bool, remote: Any = None) -> None:
         self.incomplete = None
         self.color_usage = color_usage
         self.color_help = color_help
         self.conventional = conventional  # help was asked for in fireaid's syntax
+        self.remote = remote  # (prog, variable, deny) of a remote-controlled program
 
     def __getattr__(self, name: str) -> Any:
         return getattr(_helptext, name)
@@ -499,6 +500,8 @@ class _HelpText:
                 text = _class_help(component, trace, verbose)
             if text is None:
                 text = _helptext.HelpText(component, trace=trace, verbose=verbose)
+            if self.remote is not None:
+                text = _with_remote_flag(text, trace, *self.remote, color=self.color_help)
             return _color_help(text) if self.color_help else text
         self.incomplete = trace
         return self.UsageText(component, trace=trace, verbose=verbose)
@@ -508,6 +511,38 @@ class _HelpText:
         if trace is not None and trace is self.incomplete:
             text = _without_separator(text, trace)
         return _color_usage(text) if self.color_usage else text
+
+
+_LISTS = ("GROUPS\n", "COMMANDS\n", "VALUES\n", "INDEXES\n", "NOTES\n")
+
+
+def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Sequence[str], color: bool) -> str:
+    """
+    Add --remote to the flags in the help for what can run remotely: the
+    program, its groups and commands, other than help, the server and
+    what the program denies.
+    """
+    try:
+        command = trace.GetCommand(include_separators=False)
+    except AttributeError:
+        return text
+    words = shlex.split(command)[1:]
+    module = importlib.import_module(__name__ + ".remote")
+    if words[:1] == ["help"] or module.refusal(words, deny) is not None:
+        return text
+    placeholder = "[PASSWORD@]HOST[:PORT]"
+    entry = (f"    --remote={_placeholder(placeholder) if color else placeholder}\n"
+             f"        Run the command line on HOST, where `{prog} server` is running;\n"
+             f"        see `{prog} help server`. {variable} gives it by default.")
+    sections = _SECTION_BREAK.split(text)
+    flags = next((i for i, s in enumerate(sections) if s.startswith("FLAGS\n")), None)
+    if flags is not None:
+        sections[flags] += "\n" + entry
+        return "\n\n".join(sections)
+    at = next((i for i, s in enumerate(sections) if s.startswith(_LISTS)), len(sections))
+    sections.insert(at, "FLAGS\n" + entry)
+    synopsis = re.compile(rf"^(SYNOPSIS\n    {re.escape(trace.GetCommand(include_separators=True))})( |$)")
+    return "\n\n".join(synopsis.sub(r"\1 <flags>\2", s, count=1) for s in sections)
 
 
 _SECTION_BREAK = re.compile(r"\n\n(?=[A-Z][A-Z ]*\n)")
@@ -619,6 +654,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
 
     component = arguments["component"]
     undo_server = None
+    remote_help = None
     if remote is not None:
         module = importlib.import_module(__name__ + ".remote")
         prog = arguments.get("name") or os.path.basename(sys.argv[0] if sys.argv else "")
@@ -642,6 +678,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         component, undo_server = _add_member(component, "server",
                                              *_server_command(remote, prog, variable, launch))
         arguments["component"] = component
+        remote_help = (prog, variable, remote.deny)
 
     ours = not (inspect.isroutine(component) or _member(component, "help")[0])
     undo = None
@@ -655,7 +692,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         else:
             # Help was asked for in conventional syntax: it belongs on stdout.
             display = _display_stdout
-        return _fire_with(display, *bound.args, **bound.kwargs)
+        return _fire_with(display, *bound.args, remote_help=remote_help, **bound.kwargs)
     finally:
         if undo is not None:
             undo()
@@ -663,7 +700,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
             undo_server()
 
 
-def _fire_with(display: Any, *args: Any, **kwargs: Any) -> Any:
+def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any) -> Any:
     """
     Call fire.Fire() with a stand-in for its display of help.
 
@@ -682,7 +719,8 @@ def _fire_with(display: Any, *args: Any, **kwargs: Any) -> Any:
             marks = {}
     found = {name: getattr(_formatting, name) for name in marks}
 
-    helptext = _HelpText(color_usage=color, color_help=bool(marks), conventional=display is _display_stdout)
+    helptext = _HelpText(color_usage=color, color_help=bool(marks), conventional=display is _display_stdout,
+                         remote=remote_help)
     _fire.core.helptext = helptext
     _fire.core.Display = display
     for name, stand_in in marks.items():

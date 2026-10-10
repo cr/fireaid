@@ -372,6 +372,32 @@ def test_server_is_a_command():
     assert "CLI_REMOTE" in out and "These commands only run locally: static." in out
 
 
+REMOTE_FLAG = "\n    --remote=[PASSWORD@]HOST[:PORT]\n"
+
+
+@pytest.mark.parametrize("component", ["CLI", "INSTANCE"])
+@pytest.mark.parametrize(
+    "command",
+    [["help"], ["--help"], ["help", "foo"], ["foo", "--help"], ["foo", "-h"], ["help", "dynamic"],
+     ["dynamic", "bar", "--help"]],
+)
+def test_help_lists_the_remote_flag(component, command):
+    code, out, err = run(command, component)
+    flags = out[out.index("\nFLAGS\n"):]
+    assert code == 0 and REMOTE_FLAG in flags
+    assert "CLI_REMOTE" in flags and "cli.py help server" in flags
+
+
+@pytest.mark.parametrize("command", [["help", "server"], ["help", "static"], ["help", "static", "bar"], ["help", "help"]])
+def test_no_remote_flag_where_it_does_not_run_remotely(command):
+    code, out, err = run(command, "INSTANCE")
+    assert code == 0 and REMOTE_FLAG not in out
+
+
+def test_no_remote_flag_without_remote():
+    assert "--remote" not in run(["help", "foo"], FIREAID_TEST_REMOTE="")[1]
+
+
 # -- Command lines run remotely as locally
 
 

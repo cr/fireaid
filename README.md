@@ -159,6 +159,9 @@ on such a server, anywhere on the command line before a `--`:
 The variable `TOOL_REMOTE`, named after the program, gives a default for
 the flag, and `--remote=` runs a command locally all the same.
 
+The help lists `--remote` among the flags of the program, its groups and
+its commands, except for `help`, `server` and what only runs locally.
+
 Each command runs in a new process of the program on the server, as if
 typed there, and its output, input and exit code are relayed. Where the
 client has a terminal, the command gets one of the same size, so that
