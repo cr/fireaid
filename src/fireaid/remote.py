@@ -17,6 +17,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -516,7 +517,10 @@ class _Session:
             return
         argv = request["argv"]
         tty = "".join("1" if x else "0" for x in request["tty"])
-        logger.info(f"{self.peer} runs: {shlex.join(argv)}")
+        # A flag's value may be a secret, such as a password: the whole line is for debugging only.
+        words = list(itertools.takewhile(lambda w: not w.startswith("-"), argv))
+        more = " ..." if len(words) < len(argv) else ""
+        logger.info(f"{self.peer} runs: {shlex.join(words) or '(flags)'}{more}")
         logger.debug(f"as: {shlex.join([*self.launch.prefix, *argv])} in {self.launch.cwd}; "
                      f"tty {tty}, size {request.get('size')}, env {request['env']}")
         sock.setblocking(False)

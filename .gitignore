@@ -10,3 +10,6 @@ Pipfile.lock
 .pytest_cache/
 .vscode/
 docs/
+
+# private
+TODO.md

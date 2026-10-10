@@ -135,6 +135,11 @@ class Log:
         return f"runs: {words}" in text
 
     @staticmethod
+    def ran_as(text, shown):
+        """The info line names the command as shown, and nothing more."""
+        return f"runs: {shown}\n" in text
+
+    @staticmethod
     def exited(text, code):
         return f"exit {code} after" in text
 
@@ -333,6 +338,37 @@ def test_server_setup_hook_and_debug(server):
     log = quiet.log.text
     assert Log.ran(log, "foo x") and Log.exited(log, 0)
     assert not Log.connected(log) and not Log.launched(log, "foo x")
+
+
+@pytest.mark.parametrize(
+    "command, shown",
+    [
+        ("foo x", "foo x"),
+        ("foo x --count s3cret", "foo x ..."),
+        ("foo x --count=s3cret", "foo x ..."),
+        ("dynamic bar --x s3cret", "dynamic bar ..."),
+        ("help foo", "help foo"),
+        ("foo --help", "foo ..."),
+        # Before the command, a flag's value cannot be told from a command word.
+        ("--count s3cret foo x", "(flags) ..."),
+        # A plain word is logged as given: a secret belongs in a flag.
+        ("foo s3cret", "foo s3cret"),
+    ],
+)
+def test_info_logs_the_words_up_to_the_first_flag(server, command, shown):
+    """A flag's value may be a secret: info names the command by its words up to the first flag."""
+    quiet = server()
+    before = len(quiet.log.text)
+    run([*command.split(), "--remote", quiet.target], input=b"")
+    added = quiet.log.wait(lambda text: Log.finished(text[before:]))[before:]
+    assert Log.ran_as(added, shown)
+    assert ("s3cret" in added) == ("s3cret" in shown)
+
+
+def test_debug_logs_the_whole_command_line(server):
+    loud = server(debug=True)
+    assert run(["foo", "x", "--count", "s3cret", "--remote", loud.target], input=b"")[0] == 0
+    assert Log.launched(loud.log.text, "foo x --count s3cret")
 
 
 def test_server_listens_everywhere_by_default():
