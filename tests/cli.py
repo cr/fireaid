@@ -9,9 +9,12 @@ FIREAID_TEST_REMOTE makes it a remote-controlled program, whose group
 static only runs locally.
 """
 
+from __future__ import annotations  # annotations are strings, as in most programs
+
 import os
 import sys
 import time
+from typing import Optional
 
 fire = __import__(os.environ.get("FIREAID_TEST_MODULE", "fireaid"))
 
@@ -141,6 +144,41 @@ class Needy:
     def go(self):
         """Go doc."""
         return self.path
+
+
+class Typed:
+    """Commands with type hints."""
+
+    def __init__(self, password: str | None = None, verbose: bool = False):
+        self.password = password
+        self.verbose = verbose
+
+    def who(self):
+        """Who doc."""
+        return f"who password={self.password!r} verbose={self.verbose!r}"
+
+    def text(self, word: str, count: int = 1, free=None):
+        """Text doc."""
+        return f"text word={word!r} count={count!r} free={free!r}"
+
+    def maybe(self, word: Optional[str] = None, other: "str | int" = 0):
+        """Maybe doc."""
+        return f"maybe word={word!r} other={other!r}"
+
+    @fire.decorators.SetParseFns(word=str.upper)
+    def own(self, word: str):
+        """Own doc: the program's parse function wins."""
+        return f"own word={word!r}"
+
+    @fire.decorators.SetParseFn(str.upper)
+    def default(self, word: str, *rest):
+        """Default doc: the program's default parse function wins."""
+        return f"default word={word!r} rest={rest!r}"
+
+
+def typed(word: str, count: int = 1):
+    """Typed doc."""
+    return f"typed word={word!r} count={count!r}"
 
 
 DICT = {"foo": CLI().foo, "help": lambda: "own help"}

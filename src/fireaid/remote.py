@@ -436,10 +436,6 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
         logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, handlers=[handler])
     if launch.error:
         raise RemoteError(launch.error)
-    if isinstance(password, bool) or not isinstance(password, (str, int, type(None))):
-        raise RemoteError("give the password as a string, as in --password='\"1e3\"'", 2)
-    if password is not None:
-        password = str(password)
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536:
         raise RemoteError(f"{port!r} is not a port", 2)
 

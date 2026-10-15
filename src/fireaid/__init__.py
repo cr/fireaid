@@ -51,7 +51,9 @@ import os
 import re
 import shlex
 import sys
+import typing
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata as _metadata
 from typing import Any
@@ -611,6 +613,69 @@ def _without_separator(text: str, trace: Any) -> str:
 _display = getattr(_fire.core, "Display", None)
 _helptext = getattr(_fire.core, "helptext", None)
 _formatting = getattr(_fire.core, "formatting", None)
+_decorators = getattr(_fire.core, "decorators", None)
+
+_OPTIONAL = re.compile(r"(?:typing\.)?Optional\[(.*)\]")
+
+
+def _is_str_hint(hint: Any) -> bool:
+    """Whether a type hint, as an object or as a string, means str or None."""
+    if isinstance(hint, str):
+        text = hint.strip()
+        match = _OPTIONAL.fullmatch(text)
+        if match:
+            text = match.group(1)
+        return {part.strip() for part in text.split("|")} - {"None"} == {"str"}
+    if hint is str:
+        return True
+    args = [arg for arg in typing.get_args(hint) if arg is not type(None)]
+    return len(args) == 1 and args[0] is str
+
+
+def _str_parameters(component: Any) -> list[str]:
+    """The parameters of what Fire is about to call that are hinted str."""
+    fn = component
+    if inspect.isclass(component):
+        fn = component.__init__
+    elif not inspect.isroutine(component):
+        fn = getattr(component, "__call__", None)
+    try:
+        annotations = dict(getattr(fn, "__annotations__", None) or {})
+    except Exception:  # noqa: BLE001 - a program may hide anything behind __getattr__
+        return []
+    return [name for name, hint in annotations.items() if name != "return" and _is_str_hint(hint)]
+
+
+@contextmanager
+def _typed_parsing() -> Any:
+    """
+    Have Fire keep the string of a value for a parameter hinted str.
+
+    Fire reads a function's parse functions from its metadata when it
+    calls it. For the duration of the call, the metadata gains str as
+    the parse function of each parameter hinted str, where the program
+    has not set parse functions of its own with fire.decorators.
+    """
+    original = getattr(_decorators, "GetMetadata", None)
+    key = getattr(_decorators, "FIRE_PARSE_FNS", None)
+    if original is None or key is None:
+        yield
+        return
+
+    def GetMetadata(component: Any) -> Any:  # noqa: N802 - Fire's name
+        metadata = original(component)
+        parse_fns = metadata.get(key) or {"default": None, "positional": [], "named": {}}
+        named = {name: str for name in _str_parameters(component)}
+        if not named or parse_fns.get("default") is not None:
+            return metadata
+        named.update(parse_fns["named"])
+        return {**metadata, key: {**parse_fns, "named": named}}
+
+    _decorators.GetMetadata = GetMetadata
+    try:
+        yield
+    finally:
+        _decorators.GetMetadata = original
 
 # Obtain the signature from the installed Fire version instead of
 # duplicating it here. This makes fireaid less dependent on Fire's
@@ -707,6 +772,11 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
     On a terminal, usage text is coloured, and so is help that was asked
     for in conventional syntax. Help in Fire's native syntax is Fire's.
     """
+    with _typed_parsing():
+        return _fire_with_help(display, *args, remote_help=remote_help, **kwargs)
+
+
+def _fire_with_help(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any) -> Any:
     if _display is None or _helptext is None:
         return _fire.Fire(*args, **kwargs)
 

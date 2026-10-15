@@ -159,7 +159,9 @@ class Log:
 class Server:
     def __init__(self, component, password, log, pipes=False, debug=False):
         # Loopback, so that no firewall asks about the tests.
-        argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={PASSWORD}"] if password else [])
+        # The password is True for the usual one, or a string of its own.
+        secret = password if isinstance(password, str) else PASSWORD
+        argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={secret}"] if password else [])
         argv += ["--debug"] if debug else []
         self.log = Log(log)
         self.process = subprocess.Popen(
@@ -177,7 +179,7 @@ class Server:
             time.sleep(0.05)
         self.pipes = self.log.pipes_only()
         self.port = self.log.port()
-        self.target = f"{PASSWORD}@127.0.0.1:{self.port}" if password else f"127.0.0.1:{self.port}"
+        self.target = f"{secret}@127.0.0.1:{self.port}" if password else f"127.0.0.1:{self.port}"
 
     def stop(self):
         self.process.terminate()
@@ -522,6 +524,15 @@ def test_password(server):
         code, out, err = run(["foo", "x", "--remote", target])
         assert (code, out) == (1, "")
         assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
+
+
+def test_numeric_password_is_a_string(server):
+    # Fire alone would read 1e3 as the float 1000.0; the server's hint keeps it.
+    s = server(password="1e3")
+    assert run(["foo", "x", "--remote", s.target])[:2] == (0, "foo name='x' count=1\n")
+    code, out, err = run(["foo", "x", "--remote", f"1000.0@127.0.0.1:{s.port}"])
+    assert (code, out) == (1, "")
+    assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
 
 
 def test_password_given_to_a_server_without_one_is_warned_about(server):

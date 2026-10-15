@@ -60,6 +60,23 @@ Existing code such as:
 
 continues to work, as do `import fireaid.core` and `python -m fireaid`.
 
+## Type hints
+
+Fire parses every value on the command line as a Python literal where
+it can, whatever the parameter's type hint: `--name 42` gives an `int`,
+`--name 1e3` a `float`, `--name [1,2]` a list. fireaid keeps the string
+as typed for a parameter hinted `str`, `Optional[str]` or `str | None`,
+in a function, a method or a class constructor:
+
+    def set(self, name: str, value: str):
+        ...
+
+    tool set 007 1e3        # name='007', value='1e3'
+
+Other hints are left to Fire, and so is a parameter whose parse
+function the program sets with `fire.decorators.SetParseFn` or
+`SetParseFns`.
+
 ## Help
 
 Python Fire accepts:
