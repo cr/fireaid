@@ -1,14 +1,13 @@
 # Keeps the actions the workflows use up to date: once a week, one pull
 # request for all that have a new version.
+#
+# Not the pip dependencies: for a range such as fire>=0.2.0, Dependabot
+# raises the floor to the newest version, which would drop the oldest
+# Fire, and the oldest Python with a newer setuptools. The test workflow
+# runs weekly against the latest Fire instead.
 
 version: 2
 updates:
-  # The project's dependencies. A range such as fire>=0.2.0 is left as it
-  # is; a new Fire is tested by the weekly run of the test workflow.
-  - package-ecosystem: pip
-    directory: /
-    schedule:
-      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:
