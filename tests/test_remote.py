@@ -275,6 +275,36 @@ def server(tmp_path_factory):
 # -- What the client takes from the command line
 
 
+def test_exit_code_mapping():
+    """How a command's return code reaches the client."""
+    assert remote._exit_code(0) == 0
+    assert remote._exit_code(7) == 7
+    assert remote._exit_code(-signal.SIGINT) == 128 + signal.SIGINT  # ended by a signal
+    assert remote._exit_code(remote._CONTROL_C_EXIT) == 128 + signal.SIGINT  # Windows Ctrl-Break
+    assert remote._exit_code(256) == 1 and remote._exit_code(1000) == 1  # out of a byte's range
+
+
+@pytest.mark.parametrize("hex_, ok", [("ab" * 16, True), ("ab" * 15, False), ("", False), ("xy", False), (None, False)])
+def test_nonce_must_be_long_enough(hex_, ok):
+    if ok:
+        assert remote._nonce(hex_) == bytes.fromhex(hex_)
+    else:
+        with pytest.raises(remote._ProtocolError):
+            remote._nonce(hex_)
+
+
+def test_frame_length_bounds():
+    """A frame's length must be within 1.._MAX_FRAME; the parser rejects the rest."""
+    import struct
+    for length in (0, remote._MAX_FRAME + 1):
+        with pytest.raises(remote._ProtocolError):
+            list(remote._parse(bytearray(struct.pack(">IB", length, remote.STDOUT))))
+    biggest = remote._frame(remote.STDOUT, b"x" * (remote._MAX_FRAME - 1))
+    assert list(remote._parse(bytearray(biggest))) == [(remote.STDOUT, b"x" * (remote._MAX_FRAME - 1))]
+    with pytest.raises(ValueError):
+        remote._frame(remote.STDOUT, b"x" * remote._MAX_FRAME)  # one too large to frame
+
+
 @pytest.mark.parametrize(
     "text, host, port, password",
     [
@@ -459,6 +489,183 @@ def test_server_runs_only_what_is_allowed(tmp_path):
         assert Log.refused(s.log.text, "grep")
         assert run(["help", "server", "--remote", s.target])[0] == 0
     finally:
+        s.stop()
+
+
+# -- allow holds through chained commands, not only at the start
+
+
+@pytest.mark.parametrize(
+    "allow, command, runs",
+    [
+        ("foo", "foo x", True),                       # an allowed command, with its argument
+        ("dynamic bar", "dynamic bar --x 3", True),   # navigating into an allowed path
+        ("dynamic bar", "dynamic hosty", False),      # a sibling, not allowed
+        ("echo", "echo a b c", True),                 # plain arguments do not extend the path
+        ("chain", "chain bar", False),                # a command chained onto chain()'s result
+    ],
+)
+def test_allow_holds_through_chaining(tmp_path, allow, command, runs):
+    s = Server("CLI", False, tmp_path / "log", FIREAID_TEST_ALLOW=allow)
+    try:
+        code, out, err = run([*command.split(), "--remote", s.target])
+        if runs:
+            assert (code, out, err) == run(command.split())
+        else:
+            # Refused either at the handshake (the line as text) or as it runs
+            # (a chain); either way the command does not run.
+            assert (code, out) == (2, "") and "not available remotely" in err
+    finally:
+        s.stop()
+
+
+def test_chained_command_outside_allow_does_not_run(tmp_path):
+    """chain() returns a group; a command chained onto its result is refused as it runs."""
+    s = Server("CLI", False, tmp_path / "log", FIREAID_TEST_ALLOW="chain")
+    try:
+        code, out, err = run(["chain", "bar", "--x", "9", "--remote", s.target])
+        # bar would return "bar x=9"; instead the command refuses and produces nothing.
+        assert (code, out) == (2, "")
+        assert "'bar' is not available remotely" in err and "bar x=9" not in err
+    finally:
+        s.stop()
+
+
+# -- what a client sends cannot forge or disturb the server's log
+
+
+def test_client_text_is_printable_in_the_log(tmp_path):
+    s = Server("Probe", False, tmp_path / "log")
+    try:
+        forged = "6.6.6.6 done: exit 0 after 0.0 s"
+        run(["echo", "\x1b]0;x\x07", f"a\n{forged}", "--remote", s.target], "Probe")
+        text = s.log.wait(lambda t: "echo" in t)
+        assert "\x1b" not in text, "no escape sequences reach the operator's terminal"
+        assert "\x1b]0;x" not in text
+        for line in text.splitlines():
+            assert not line.startswith(forged), "a newline does not forge a log line"
+    finally:
+        s.stop()
+
+
+# -- many clients at once are served, or told busy, never dropped
+
+
+def test_many_clients_are_served_not_dropped(server):
+    """More clients than the login limit still all get served within the wait."""
+    import concurrent.futures
+
+    target = server("Probe").target
+
+    def once(i):
+        return run(["env", "TERM", "--remote", target], "Probe", TERM=f"t{i}", input=b"")
+
+    with concurrent.futures.ThreadPoolExecutor(16) as pool:
+        results = list(pool.map(once, range(16)))
+    for code, out, err in results:
+        assert code == 0, err
+        assert "connection closed" not in err
+    assert sum(out == f"TERM=t{i}\n" for i, (_, out, _) in enumerate(results)) == 16
+
+
+# -- allow as a command runs: groups, properties, a command's own Fire call
+
+
+@pytest.mark.parametrize(
+    "allow, command",
+    [
+        ("group bar", "group bar"),  # a group given as a class: instantiating it is navigation, not the command
+        ("sync", "sync"),  # what an allowed command does with Fire itself is its own business
+    ],
+)
+def test_allow_lets_through_what_it_names(tmp_path, allow, command):
+    s = Server("Device", False, tmp_path / "log", FIREAID_TEST_ALLOW=allow)
+    try:
+        here = run(command.split(), "Device")
+        assert here[0] == 0
+        assert run([*command.split(), "--remote", s.target], "Device") == here
+    finally:
+        s.stop()
+
+
+def test_refused_member_does_not_run(tmp_path):
+    """A property chained onto an allowed command's result is refused before any of its code runs."""
+    s = Server("Device", False, tmp_path / "log", FIREAID_TEST_ALLOW="on")
+    try:
+        code, out, err = run(["on", "gadget", "--remote", s.target], "Device")
+        assert (code, out) == (2, "") and "'gadget' is not available remotely" in err
+        # Old Fire finds any member by reading them all, properties included,
+        # as it does locally too: there the property runs on the way to on.
+        if "getmembers" not in inspect.getsource(fireaid.core._GetMember):
+            assert "GADGET CODE RAN" not in err
+    finally:
+        s.stop()
+
+
+def test_refusals_are_printable_in_the_log(tmp_path):
+    """A refusal quotes the client's word; the log shows it rather than acting on it."""
+    s = Server("Device", False, tmp_path / "log", FIREAID_TEST_ALLOW="on")
+    try:
+        assert run(["\x1b]0;x\x07", "--remote", s.target], "Device")[0] == 2
+        text = s.log.wait(lambda t: "not available remotely" in t)
+        assert "not available remotely" in text
+        assert "\x1b" not in text and "\x07" not in text
+    finally:
+        s.stop()
+
+
+def test_printable_shows_every_control_character():
+    for c in "\x00\x07\x1b\n\r\x7f\x85\x9b\u2028\u2029\u202e":
+        shown = remote._printable(f"a{c}b")
+        assert c not in shown and shown[0] == "a" and shown[-1] == "b", repr(shown)
+    assert remote._printable("tab\tand ünïcödé") == "tab\tand ünïcödé"
+
+
+def test_clients_beyond_the_login_limit_are_told_so(tmp_path):
+    """With every login slot held by a client that says nothing, the next is told why, not dropped."""
+    s = Server("Probe", False, tmp_path / "log")
+    idle = []
+    try:
+        idle = [socket.create_connection(("127.0.0.1", s.port)) for _ in range(remote._MAX_HANDSHAKES)]
+        time.sleep(0.5)  # for the server to take them all
+        code, out, err = run(["tty", "--remote", s.target], "Probe")
+        assert (code, out) == (1, "")
+        assert "too many clients logging in" in err and "connection closed" not in err
+    finally:
+        for sock in idle:
+            sock.close()
+        s.stop()
+
+
+def test_clients_waiting_to_run_are_bounded(tmp_path):
+    """Logged-in clients waiting for the running command are bounded; beyond that, told so at once."""
+    s = Server("Probe", False, tmp_path / "log")
+    first = subprocess.Popen(
+        [sys.executable, "cli.py", "sleep", "--remote", s.target],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment("Probe"), cwd=TESTS,
+    )
+    waiting = []
+    request = {"argv": ["tty"], "tty": [False, False, False], "env": {}}
+    try:
+        assert first.stdout.readline().rstrip(b"\r\n") == b"started"
+        for _ in range(remote._MAX_WAITING):
+            channel, (kind, _) = log_in(s.port)
+            assert kind == remote.AUTH_OK
+            channel.write(remote.RUN, request)
+            waiting.append(channel)
+        time.sleep(1)  # for each to start waiting
+        started = time.monotonic()
+        channel, _ = log_in(s.port)
+        waiting.append(channel)
+        channel.write(remote.RUN, request)
+        kind, payload = channel.read()
+        assert kind == remote.REFUSED and "too many clients waiting" in remote._json(payload)["message"]
+        assert time.monotonic() - started < 3, "told at once, not after the wait"
+    finally:
+        for channel in waiting:
+            channel.sock.close()
+        first.kill()
+        first.wait()
         s.stop()
 
 

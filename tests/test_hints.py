@@ -260,6 +260,23 @@ def test_hinted_value_rejected(hint, text, form, capsys):
 
 
 @pytest.mark.parametrize(
+    "hint, inner, optional",
+    [
+        ("int", "int", False),
+        ("int | None", "int", True),
+        ("None | int", "int", True),
+        ("Optional[int]", "int", True),
+        ("typing.Optional[str]", "str", True),
+        ("int | str", "int | str", False),  # a real union: left to Fire, unwrapped to itself
+        ("int | str | None", "int | str | None", True),  # a union, not unwrapped, but None is noticed
+    ],
+)
+def test_unwrap_reads_optional_from_the_words(hint, inner, optional):
+    """When a string annotation cannot be evaluated, Optional is read from its words."""
+    assert hints._unwrap(hint) == (inner, optional)
+
+
+@pytest.mark.parametrize(
     "hint, text, expected",
     [
         # Hints fireaid does not read are Fire's: unions, containers, Any, classes of its own.

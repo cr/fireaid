@@ -72,6 +72,40 @@ class CLI:
         print("EFFECT")
         return word
 
+    def chain(self):
+        """Chain doc: returns a group, so trailing words chain onto the result."""
+        return Sub()
+
+
+class Group:
+    def bar(self):
+        """Group bar doc."""
+        return "group bar"
+
+
+class Device:
+    """Commands that test how an allow list holds as a command runs."""
+
+    group = Group  # a group given as a class, which Fire instantiates on the way
+
+    def on(self):
+        """Switch on, returning the device for chaining."""
+        return self
+
+    def firmware(self, path="x"):
+        """Firmware doc."""
+        return f"FLASHED {path}"
+
+    @property
+    def gadget(self):
+        """A property whose code has an effect."""
+        print("GADGET CODE RAN", file=sys.stderr)
+        return "gadget"
+
+    def sync(self):
+        """Run a sub-tool of its own through Fire, as some commands do."""
+        return fire.Fire(Sub, command=["bar"], name="sub")
+
 
 class WithHelp(CLI):
     def help(self, topic="general"):

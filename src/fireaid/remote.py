@@ -96,6 +96,7 @@ _CONNECT_TIMEOUT = 5.0
 _TRANSIENT = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.EADDRNOTAVAIL}
 _HANDSHAKE_TIMEOUT = 10.0
 _MAX_HANDSHAKES = 8  # clients logging in at once; more are turned away
+_MAX_WAITING = 16  # logged-in clients waiting for the running command; more are told so at once
 _BUSY_WAIT = 5.0  # how long a client logged in waits for the command before it, as one ends
 # How long a done command's output may stay quiet before what still holds
 # it open, something the command left running, is left behind.
@@ -247,11 +248,12 @@ def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | Non
     asked for, in its plain forms.
 
     Where there is an allow list, a command line must start with one of
-    its command paths, or ask for help for one; what a chain reaches
-    from there is that command's. The program's own help and usage, and
-    help for help and the server, are always there. A flag's value
-    before the command cannot be told from a command word, so such a
-    flag goes after it.
+    its command paths, or ask for help for one. What a chain reaches
+    from there cannot be told from the text: the command's own process
+    holds it to the allow list as it runs. The program's own help and
+    usage, and help for help and the server, are always there. A flag's
+    value before the command cannot be told from a command word, so such
+    a flag goes after it.
     """
     argv = list(argv)
     if "--" in argv:
@@ -413,6 +415,25 @@ class _Channel:
         return list(_parse(self.incoming))
 
 
+def _printable(text: str) -> str:
+    """
+    Text for a log line, with what a terminal or a log reader would act
+    on shown escaped instead: control characters, C1 ones and Unicode's
+    line separators and direction overrides among them. A tab stays.
+    """
+    return "".join(c if c.isprintable() or c == "\t" else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
+def _refuse(sock: socket.socket, message: str, code: int) -> None:
+    """Tell a client it is refused, on a socket with no session, and close it."""
+    try:
+        sock.sendall(_frame(REFUSED, {"message": message, "code": code}))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
 def _mac(password: str, side: str, server_nonce: bytes, client_nonce: bytes) -> str:
     """The proof that a side, client or server, knows the password: each proves it on a text of its own."""
     text = side.encode() + b"\0" + server_nonce + client_nonce
@@ -557,20 +578,23 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
 
     hidden = (variable, secret)  # what the commands do not get from the server's environment
     ready: queue.Queue = queue.Queue()  # sessions logged in, whose command is to run
-    busy = threading.Lock()  # held from a login until its command has run
-    logins = threading.BoundedSemaphore(_MAX_HANDSHAKES)
+    busy = threading.Lock()  # held from reserving the server until the command has run
+    logins = threading.BoundedSemaphore(_MAX_HANDSHAKES)  # clients still logging in
+    waiting = threading.BoundedSemaphore(_MAX_WAITING)  # clients logged in, waiting for the server
     stopping = threading.Event()
 
     def admit(sock: socket.socket, peer: Any) -> None:
         session = _Session(sock, peer, launch, deny, allow, hidden, password)
         try:
-            if session.admit(busy):
+            try:
+                pending = session.log_in()
+            finally:
+                logins.release()  # the slot is for logging in, not for waiting to run
+            if pending and session.reserve(busy, waiting):
                 ready.put(session)
                 return
         except Exception as e:  # one client must not stop the server
-            logger.error(f"{peer[0]}: {e}")
-        finally:
-            logins.release()
+            logger.error(f"{peer[0]}: {_printable(str(e))}")
         session.close()
 
     def accept() -> None:
@@ -585,9 +609,13 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
             logger.debug(f"{peer[0]}:{peer[1]} connected")
             if not logins.acquire(blocking=False):
                 logger.info(f"{peer[0]}: turned away, {_MAX_HANDSHAKES} clients are logging in")
-                sock.close()
+                _refuse(sock, "the server has too many clients logging in; try again shortly", 1)
                 continue
-            threading.Thread(target=admit, args=(sock, peer), daemon=True).start()
+            try:
+                threading.Thread(target=admit, args=(sock, peer), daemon=True).start()
+            except RuntimeError:  # no thread to be had: the client is told, and the server goes on
+                logins.release()
+                _refuse(sock, "the server is overloaded; try again shortly", 1)
 
     threading.Thread(target=accept, daemon=True).start()
     try:
@@ -599,7 +627,7 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
             try:
                 session.run()
             except Exception as e:  # one client must not stop the server
-                logger.error(f"{session.peer}: {e}")
+                logger.error(f"{session.peer}: {_printable(str(e))}")
             finally:
                 busy.release()
                 session.close()
@@ -627,10 +655,12 @@ class _Session:
         self.password = password
         self.request: dict = {}
 
-    def admit(self, busy: threading.Lock) -> bool:
+    def log_in(self) -> bool:
         """
         Log the client in and take its command line, in a thread of its
-        own. Returns whether the command is to run, then holding busy.
+        own. Returns whether there is a command to run, then held in
+        self.request. This is the one step the login slots limit, so it
+        does not wait for the server to be free; reserve does that.
         """
         _keep_alive(self.channel.sock)
         self.channel.sock.settimeout(_HANDSHAKE_TIMEOUT)
@@ -640,16 +670,29 @@ class _Session:
             self.refuse(str(e), 2)
             return False
         except (OSError, EOFError) as e:
-            logger.debug(f"{self.peer}: gone during the handshake: {e}")
+            logger.debug(f"{self.peer}: gone during the handshake: {_printable(str(e))}")
             return False
         if request is None:
             return False
-        # A command ending, such as one whose client has gone, takes a moment.
-        if not busy.acquire(timeout=_BUSY_WAIT):
-            self.refuse("busy with another client's command; try again later", 1)
-            return False
         self.request = request
         return True
+
+    def reserve(self, busy: threading.Lock, waiting: threading.BoundedSemaphore) -> bool:
+        """
+        Take the run lock for this command, waiting a moment for it among
+        a bounded number of others, or tell the client the server is busy.
+        """
+        if not waiting.acquire(blocking=False):
+            self.refuse("the server has too many clients waiting; try again later", 1)
+            return False
+        try:
+            # A command ending, such as one whose client has gone, takes a moment.
+            if busy.acquire(timeout=_BUSY_WAIT):
+                return True
+        finally:
+            waiting.release()
+        self.refuse("busy with another client's command; try again later", 1)
+        return False
 
     def run(self) -> None:
         request = self.request
@@ -658,9 +701,11 @@ class _Session:
         # A flag's value may be a secret, such as a password: the whole line is for debugging only.
         words = list(itertools.takewhile(lambda w: not w.startswith("-"), argv))
         more = " ..." if len(words) < len(argv) else ""
-        logger.info(f"{self.peer} runs: {shlex.join(words) or '(flags)'}{more}")
-        logger.debug(f"as: {shlex.join([*self.launch.prefix, *argv])} in {self.launch.cwd}; "
-                     f"tty {terminals}, size {request.get('size')}, env {request['env']}")
+        # The words are the client's; control characters in them neither move
+        # the operator's cursor nor forge a line of their own in the log.
+        logger.info(f"{self.peer} runs: {_printable(shlex.join(words)) or '(flags)'}{more}")
+        logger.debug(f"as: {_printable(shlex.join([*self.launch.prefix, *argv]))} in {self.launch.cwd}; "
+                     f"tty {terminals}, size {request.get('size')}, env {_printable(str(request['env']))}")
         self.channel.sock.setblocking(False)
         runner = _PtyCommand if _pty_available() else _PipeCommand
         started = time.monotonic()
@@ -676,7 +721,7 @@ class _Session:
         logger.debug(f"{self.address[0]}:{self.address[1]} done")
 
     def refuse(self, message: str, code: int) -> None:
-        logger.info(f"{self.peer}: {message}")
+        logger.info(f"{self.peer}: {_printable(message)}")  # a refusal may quote what the client sent
         try:
             self.channel.write(REFUSED, {"message": message, "code": code})
         except OSError:
@@ -1362,7 +1407,12 @@ class _Client:
 
     def handshake(self, argv: list[str]) -> None:
         channel = self.channel
-        challenge = _json(channel.expect(CHALLENGE))
+        kind, payload = channel.read()
+        if kind == REFUSED:  # the server turned us away before the challenge
+            self.refused(payload)
+        if kind != CHALLENGE:
+            raise _ProtocolError(f"unexpected message {kind}")
+        challenge = _json(payload)
         if challenge.get("proto") != PROTOCOL:
             raise RemoteError(f"{self.target} speaks fireaid remote protocol {challenge.get('proto')}, "
                               f"this client speaks {PROTOCOL}")

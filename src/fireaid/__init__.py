@@ -59,6 +59,7 @@ import re
 import shlex
 import sys
 from collections.abc import Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -281,7 +282,10 @@ class Remote:
 
     ``allow``, if given, names the only command paths that run remotely,
     each as its words, such as ``("status", "db list")``: a command line
-    must start with one of them. It is what to use for a program that
+    must start with one of them, and a command chained onto another's
+    result must be allowed too, which the command's own process holds
+    it to as it runs. Allowing a group allows what is in it. It is what
+    to use for a program that
     controls something physical, so that a new command stays local
     until it is allowed. ``deny`` names command paths that only run
     locally, such as ``("firmware",)`` or ``("db drop",)``, wherever they
@@ -709,6 +713,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
     component = arguments["component"]
     undo_server = None
     remote_help = None
+    enforce_allow = None
     if remote is not None:
         module = _remote_module()
         prog = arguments.get("name") or os.path.basename(sys.argv[0] if sys.argv else "")
@@ -732,6 +737,11 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         component, undo_server = _add_member(component, "server", _server_command(remote, prog, variable, launch))
         arguments["component"] = component
         remote_help = (prog, variable, remote.deny, remote.allow)
+        if remote.allow is not None and os.environ.get(module.CHILD_VARIABLE):
+            # In the command's own process on the server: hold the command to
+            # what is allowed as it actually runs, chained calls included,
+            # where the server's check of the command line as text cannot.
+            enforce_allow = remote.allow
 
     ours = not (inspect.isroutine(component) or _member(component, "help")[0])
     undo = None
@@ -745,7 +755,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         else:
             # Help was asked for in conventional syntax: it belongs on stdout.
             display = _display_stdout
-        return _fire_with(display, *bound.args, remote_help=remote_help, **bound.kwargs)
+        return _fire_with(display, *bound.args, remote_help=remote_help, enforce_allow=enforce_allow, **bound.kwargs)
     finally:
         if undo is not None:
             undo()
@@ -753,7 +763,68 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
             undo_server()
 
 
-def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any) -> Any:
+@contextmanager
+def _allowed_calls(allow: Sequence[str]) -> Any:
+    """
+    Hold a running command to the allowed paths, by what Fire takes.
+
+    The server's refusal reads the command line as text and so sees only
+    where it starts. Here, in the command's own process, each command
+    word is checked before Fire looks it up, so that not even a
+    property's code runs for a word refused: navigating towards or
+    within an allowed path is let through, a class on the way included,
+    which Fire instantiates; but once a routine has been called, a
+    further command word is a chain onto its result, and refused. help
+    and server are fireaid's own and left alone.
+
+    Only the command's own run is held so: what the command does with
+    Fire itself, in a nested call, is its own business. A refusal ends
+    the run at once, without Fire's usage text, which would read every
+    member, properties included, to list them.
+    """
+    allowed = [tuple(w.replace("-", "_") for w in entry.split()) for entry in allow]
+    run, get_member, call = _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace
+    path: list[str] = []
+    called = [False]
+    depth = [0]  # Fire runs under way: 1 is the command's own
+
+    def refuse(words: str) -> None:
+        print(f"ERROR: {words!r} is not available remotely", file=sys.stderr)
+        raise _fire.core.FireExit(2, None)
+
+    def _Fire(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
+        depth[0] += 1
+        try:
+            return run(*args, **kwargs)
+        finally:
+            depth[0] -= 1
+
+    def _GetMember(component: Any, args: Any) -> Any:  # noqa: N802 - Fire's name
+        if depth[0] == 1:
+            word = args[0].replace("-", "_")
+            if called[0]:
+                refuse(args[0])  # a command word after a command ran: a chain onto its result
+            here = (*path, word)
+            if here[0] not in ("help", "server") and not any(here[: len(a)] == a[: len(here)] for a in allowed if a):
+                refuse(" ".join(here))
+            path.append(word)
+        return get_member(component, args)
+
+    def _CallAndUpdateTrace(component: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
+        # Calling a routine once a command word was taken runs the command.
+        # Instantiating a class does not: it is the program, or a group on the way.
+        if depth[0] == 1 and path and not inspect.isclass(component):
+            called[0] = True
+        return call(component, *args, **kwargs)
+
+    _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace = _Fire, _GetMember, _CallAndUpdateTrace
+    try:
+        yield
+    finally:
+        _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace = run, get_member, call
+
+
+def _fire_with(display: Any, *args: Any, remote_help: Any = None, enforce_allow: Any = None, **kwargs: Any) -> Any:
     """
     Call fire.Fire() with stand-ins for its display of help and its parsing.
 
@@ -779,7 +850,8 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
     if color:
         sys.stdout, sys.stderr = map(_unstripped, streams)
     try:
-        with _hints.typed_parsing():
+        with _hints.typed_parsing(), \
+                (_allowed_calls(enforce_allow) if enforce_allow is not None else nullcontext()):
             result = _fire.Fire(*args, **kwargs)
     finally:
         sys.stdout, sys.stderr = streams

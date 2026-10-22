@@ -256,10 +256,14 @@ until it is allowed:
     fire.Fire(MyTool, remote=fire.Remote(allow=("status", "on", "off")))
 
 A command line must then start with one of them, or ask for help for
-one; what a chain of commands reaches from there is that command's.
-The program's help and usage, and help for `help` and `server`, are
-always there. A flag with a value goes after the command, since before
-it the value cannot be told from a command.
+one. Allowing a group allows what is in it: `allow=("db",)` allows
+`db list` and `db drop` alike. Fire also chains commands, calling a
+command and then another on what it returns; the server holds the
+command to what is allowed as it runs, so that a command allowed does
+not lead to one that is not, whether by its result or by a group it
+reaches. The program's help and usage, and help for `help` and
+`server`, are always there. A flag with a value goes after the command,
+since before it the value cannot be told from a command.
 
 Commands that must only run locally are named in `deny`:
 
@@ -296,8 +300,9 @@ output, take over a session once it has started, and try passwords
 against a recorded login.
 
 The server runs one command at a time. A client that logs in meanwhile
-waits a few seconds for it to end, then is told the server is busy;
-clients slow to log in keep no other out. Server and client notice
+waits a few seconds for it to end, then is told the server is busy, as
+is one that finds many others waiting already; clients slow to log in
+keep no other out. Server and client notice
 within a minute or so when the other has vanished without a word, as a
 computer gone to sleep does.
 
