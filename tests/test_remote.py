@@ -1663,6 +1663,31 @@ def test_pipes_only_denied(server):
     assert (code, out) == (2, "") and Said.refused(err)
 
 
+@unix  # closes the client's descriptors before it starts
+@pytest.mark.parametrize("closed", [(1,), (1, 2)], ids=["stdout", "stdout and stderr"])
+def test_client_with_its_output_closed(server, closed):
+    """
+    With stdout closed, as cron or a daemon may run a tool, the command's
+    output goes nowhere, as it would locally; the connection does not
+    take the closed descriptor's number and get the output instead.
+    """
+    s = server("Probe")
+    before = len(s.log.text)
+
+    def close():
+        for fd in closed:
+            os.close(fd)
+
+    completed = subprocess.run(
+        [sys.executable, "cli.py", "env", "TERM", "--remote", s.target],
+        stdin=subprocess.DEVNULL, stderr=None if 2 in closed else subprocess.PIPE,
+        env=environment("Probe"), cwd=TESTS, preexec_fn=close, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    added = s.log.wait(lambda text: Log.exited(text[before:], 0))[before:]
+    assert Log.exited(added, 0), added
+
+
 @unix
 @pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
 def test_interrupt_without_a_terminal(server, pipes):

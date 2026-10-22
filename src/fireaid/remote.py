@@ -1316,8 +1316,27 @@ def connect(target: Target, timeout: float = _CONNECT_TIMEOUT) -> socket.socket:
     raise RemoteError(f"cannot reach {target}: {tried}{hint}")
 
 
+def _fill_closed_stdio() -> None:
+    """
+    Point stdin, stdout or stderr at the null device where it is closed,
+    as a daemon does. The client writes to them by number, and a socket
+    opened next would otherwise take the closed one's number, and get the
+    command's output written into it. With the null device there, output
+    to a closed stdout goes nowhere, as it would locally.
+    """
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            null = os.open(os.devnull, os.O_RDWR)
+            if null != fd:  # the lower ones are open, so it gets fd; should it not, move it there
+                os.dup2(null, fd)
+                os.close(null)
+
+
 def run_client(target: Target, argv: Sequence[str]) -> int:
     """Run a command line on a server. Returns its exit code."""
+    _fill_closed_stdio()
     sock = connect(target)
     try:
         return _Client(sock, target).run(list(argv))
