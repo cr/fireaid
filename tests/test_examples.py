@@ -12,18 +12,25 @@ import pytest
 EXAMPLES = Path(__file__).parent.parent / "examples"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the tour is a shell script")
-def test_tour():
+def tour(name):
+    """Run a tour, which is a shell script, and return what it prints."""
+    if sys.platform == "win32":
+        pytest.skip("the tours are shell scripts")
     completed = subprocess.run(
-        ["sh", str(EXAMPLES / "tour.sh")],
+        ["sh", str(EXAMPLES / name)],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         env={"PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin"},
+        timeout=60,
     )
-    assert completed.returncode == 0
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stderr == ""
-    out = completed.stdout
+    return completed.stdout
+
+
+def test_tour():
+    out = tour("tour.sh")
     assert "Usage: pantry.py <group|command>\n" in out
     assert "(exit code 2)" in out
     assert "  available commands:    add | help | list | remove | search\n" in out
@@ -36,6 +43,33 @@ def test_tour():
     assert "Searching for 'milk' everywhere." in out
     assert "(nothing, it all went to stderr)" in out
     assert "NAME\n    pantry.py add milk 2" in out
+
+
+def test_hints_tour():
+    out = tour("hints_tour.sh")
+    assert "normal priority: '007' on Thursday 2026-10-15 at 09:00\n" in out
+    assert "normal priority: 'Plants' on Thursday 2026-10-15 at 08:30\n" in out
+    assert "high priority: 'Stand-up' on Monday 2026-10-19 at 09:15, every 1 day, 0:00:00\n" in out
+    assert "reminder 3 put off by 1:30:00\n" in out
+    assert "ERROR: on: '15.10.2026' is not a date, YYYY-MM-DD\n" in out
+    assert "ERROR: by: 'soon' is not a duration: seconds, 1h30m or H:MM:SS\n" in out
+    assert "ERROR: priority: 'urgent' is not one of low, normal, high\n" in out
+    assert out.count("(exit code 2)") == 3
+
+
+def test_remote_tour():
+    out = tour("remote_tour.sh")
+    # Off without remote=: the flag is the program's, and there is no server.
+    assert "Listing items where {'remote': '127.0.0.1'}.\n" in out
+    assert "ERROR: Could not consume arg: server\n" in out
+    # On with it.
+    assert "\nno room: LAMP_ROOM is not set here\n" in out
+    assert "\nkitchen\n" in out
+    assert "\nbrightness 70%\n" in out
+    assert "'firmware' is not available remotely\n(exit code 2)\n" in out
+    assert "authentication failed\n(exit code 1)\n" in out
+    assert "    --remote=[PASSWORD@]HOST[:PORT]\n" in out
+    assert "lamp.py: 127.0.0.1 runs: brightness 70\n" in out
 
 
 def progress(*args, **env):
