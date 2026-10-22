@@ -1,0 +1,1616 @@
+"""
+Remote control for Fire programs.
+
+``fire.Fire(component, remote=True)`` gives a program a ``server``
+command, and a ``--remote [PASSWORD@]HOST[:PORT]`` flag that runs the
+rest of the command line on such a server. The server runs every
+command line in a fresh process of the program, whose standard input,
+output and error are terminals or pipes as the client's are, so that
+the program behaves as it does locally. A server on Windows, which has
+no pseudo-terminals, gives every command pipes.
+
+Imported by fireaid only when a program asks for it in its call of
+fire.Fire; nothing outside the program turns remote control on.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import hmac
+import ipaddress
+import itertools
+import json
+import logging
+import os
+import queue
+import secrets
+import select
+import selectors
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+try:
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # Windows
+    fcntl = termios = tty = None
+
+# Whether this system has pseudo-terminals for the commands a server runs.
+HAS_PTY = termios is not None and hasattr(os, "openpty")
+
+logger = logging.getLogger("fireaid.remote")
+
+# The version of the messages below: client and server speak the same one.
+PROTOCOL = 1
+FLAG = "--remote"
+
+# Set in the environment of every command the server runs.
+CHILD_VARIABLE = "FIREAID_REMOTE_CHILD"
+
+# Makes server and client behave as on Windows: the server gives commands
+# pipes, the client leaves its terminal alone and reads it in a thread.
+_TEST_NO_PTY_VARIABLE = "FIREAID_REMOTE_TEST_NO_PTY"
+
+# What decides how a program presents its output, taken from the client.
+TERMINAL_VARIABLES = (
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "COLUMNS",
+    "LINES",
+)
+# Not PAGER: Fire runs it in a shell, so a client's would run on the server.
+
+# Messages. A frame is the length of what follows, the type, and the
+# payload: JSON for control messages, bytes for data. The server sends
+# CREDIT for the input it is ready to take, and takes no more.
+HELLO, AUTH, RUN, STDIN, STDIN_EOF, WINCH, SIGNAL = 1, 2, 3, 4, 5, 6, 7
+CHALLENGE, AUTH_OK, REFUSED, STDOUT, STDERR, EXIT, TTY, CREDIT = 129, 130, 131, 132, 133, 134, 135, 136
+
+_HEADER = struct.Struct(">IB")
+_MAX_FRAME = 1 << 20
+_CHUNK = 1 << 16
+_BACKLOG = 1 << 20  # buffered output beyond which reading pauses, and the input a server takes ahead
+_SIGNALS = {name: getattr(signal, "SIG" + name) for name in ("INT", "TERM", "HUP", "QUIT")
+            if hasattr(signal, "SIG" + name)}
+_CONTROL_C_EXIT = 0xC000013A  # how Windows reports a process ended by Ctrl-Break
+
+_CONNECT_TIMEOUT = 5.0
+# Errors a fresh LAN neighbour gives for a moment, while its address is being resolved.
+_TRANSIENT = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.EADDRNOTAVAIL}
+_HANDSHAKE_TIMEOUT = 10.0
+_MAX_HANDSHAKES = 8  # clients logging in at once; more are turned away
+_MAX_WAITING = 16  # logged-in clients waiting for the running command; more are told so at once
+_BUSY_WAIT = 5.0  # how long a client logged in waits for the command before it, as one ends
+# How long a done command's output may stay quiet before what still holds
+# it open, something the command left running, is left behind.
+_LINGER = 0.5
+# A peer that vanished without a word is given up after a minute or so.
+_KEEPALIVE = (("TCP_KEEPIDLE", 30), ("TCP_KEEPALIVE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3))
+_TICK = 0.2
+_POLL = 0.05  # the wait of a loop that also takes from a queue
+
+
+def _like_windows() -> bool:
+    return os.name == "nt" or bool(os.environ.get(_TEST_NO_PTY_VARIABLE))
+
+
+def _pty_available() -> bool:
+    return HAS_PTY and not _like_windows()
+
+
+class RemoteError(Exception):
+    """A failure to be reported to the user, with the exit code to use."""
+
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _ProtocolError(Exception):
+    pass
+
+
+# -- The command line
+
+
+def _stem(prog: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in os.path.splitext(prog)[0].upper())
+
+
+def environment_variable(prog: str, configured: str | None = None) -> str:
+    """The variable a client takes --remote from: PROG_REMOTE."""
+    return configured or _stem(prog) + "_REMOTE"
+
+
+def password_variable(prog: str) -> str:
+    """The variable a server takes its password from: PROG_SERVER_PASSWORD."""
+    return _stem(prog) + "_SERVER_PASSWORD"
+
+
+def _endpoint(host: str, port: int) -> str:
+    """HOST:PORT, an IPv6 address in brackets."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+@dataclass(frozen=True)
+class Target:
+    host: str
+    port: int
+    password: str | None
+
+    def __str__(self) -> str:
+        return _endpoint(self.host, self.port)
+
+
+def parse_target(text: str, default_port: int) -> Target:
+    """
+    Parse ``[PASSWORD@]HOST[:PORT]``.
+
+    The password ends at the last ``@``, so it may contain ``@``
+    itself. An IPv6 address goes in brackets: ``[::1]:4247``.
+    """
+    password = None
+    if "@" in text:
+        password, _, text = text.rpartition("@")
+    port_text = None
+    if text.startswith("["):
+        host, closed, rest = text[1:].partition("]")
+        if not closed or (rest and not rest.startswith(":")):
+            raise ValueError("an IPv6 address goes in brackets, as in [::1]:4247")
+        port_text = rest[1:] if rest else None
+    elif text.count(":") > 1:
+        raise ValueError("an IPv6 address goes in brackets, as in [::1]:4247")
+    else:
+        host, colon, port_text = text.partition(":")
+        port_text = port_text if colon else None
+    if not host:
+        raise ValueError("no host")
+    if port_text is None:
+        return Target(host, default_port, password)
+    if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+        raise ValueError(f"{port_text!r} is not a port")
+    return Target(host, int(port_text), password)
+
+
+def take_flag(command: Sequence[str], default_port: int, variable: str) -> tuple[Target | None, list[str]]:
+    """
+    Take ``--remote`` out of a command line.
+
+    Returns the target, or None to run the command here, and the
+    command line without the flag. The flag may be anywhere before a
+    ``--``, as ``--remote VALUE`` or ``--remote=VALUE``. Without it, the
+    target comes from the environment variable, except for the server
+    command, which never runs remotely. An empty value runs the command
+    here.
+    """
+    words = list(command)
+    rest: list[str] = []
+    value = None
+    seen = False
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == "--":
+            rest.extend(words[i:])
+            break
+        if word == FLAG or word.startswith(FLAG + "="):
+            if seen:
+                raise RemoteError(f"{FLAG} is given twice", 2)
+            seen = True
+            if word == FLAG:
+                if i + 1 == len(words) or words[i + 1] == "--":
+                    raise RemoteError(f"{FLAG} needs a value: [PASSWORD@]HOST[:PORT]", 2)
+                value = words[i + 1]
+                i += 2
+            else:
+                value = word[len(FLAG) + 1 :]
+                i += 1
+            continue
+        rest.append(word)
+        i += 1
+
+    source = FLAG
+    if not seen and rest[:1] != ["server"]:
+        value = os.environ.get(variable)
+        source = variable
+    if not value:
+        return None, rest
+    try:
+        return parse_target(value, default_port), rest
+    except ValueError as e:
+        raise RemoteError(f"{source}: {e}", 2) from None
+
+
+def not_available(words: str) -> str:
+    """How a refusal names what does not run remotely, wherever it is refused."""
+    return f"'{words}' is not available remotely"
+
+
+def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | None = None) -> str | None:
+    """
+    Tell why the server will not run a command line, or None if it will.
+
+    Nothing may follow the last ``--``. Fire's own flags go there, its
+    interactive mode among them, which is a Python shell; none is needed
+    remotely, as ``--help`` works without a separator. A deny entry
+    names a command path, as words. It covers every command line in
+    which those words appear in that order, help for them included:
+    Fire chains commands, so a denied command may be reached after
+    another. The server command itself is denied unless help for it is
+    asked for, in its plain forms.
+
+    Where there is an allow list, a command line must start with one of
+    its command paths, or ask for help for one. What a chain reaches
+    from there cannot be told from the text: the command's own process
+    holds it to the allow list as it runs. The program's own help and
+    usage, and help for help and the server, are always there. A flag's
+    value before the command cannot be told from a command word, so such
+    a flag goes after it.
+    """
+    argv = list(argv)
+    words = argv
+    if "--" in argv:
+        if argv[len(argv) - argv[::-1].index("--") :]:
+            return "flags after -- are not available remotely; --help works without the separator"
+        words = argv[: argv.index("--")]
+    if any(w == FLAG or w.startswith(FLAG + "=") for w in words):
+        return f"{FLAG} cannot be passed on to the server"
+
+    def fold(text: str) -> list[str]:
+        return [w.replace("-", "_") for w in text.split()]
+
+    path = fold(" ".join(w for w in words if not w.startswith("-")))
+    for entry in deny:
+        steps = fold(entry)
+        if steps and any(path[i : i + len(steps)] == steps for i in range(len(path))):
+            return not_available(entry)
+    if "server" in path and argv not in (["help", "server"], ["server", "--help"], ["server", "-h"]):
+        return not_available("server")
+    if allow is not None:
+        command = path[1:] if path[:1] == ["help"] else path
+        if command and command[0] not in ("help", "server") and not any(
+                command[: len(steps)] == steps for steps in map(fold, allow) if steps):
+            shown = [w for w in words if not w.startswith("-")]
+            hint = "; a flag with a value goes after the command" if words[0].startswith("-") else ""
+            return not_available(shown[len(path) - len(command)]) + hint
+    return None
+
+
+# -- How the server starts the program
+
+
+@dataclass(frozen=True)
+class Launch:
+    """How to start the running program again, with other arguments."""
+
+    prefix: tuple[str, ...]
+    cwd: str
+    error: str | None = None
+
+    @classmethod
+    def capture(cls) -> Launch:
+        cwd = os.getcwd()
+        main = sys.modules.get("__main__")
+        spec = getattr(main, "__spec__", None)
+        if spec is not None and spec.name:
+            # python -m package: run the package again, not its file.
+            name = spec.name
+            if name.endswith(".__main__"):
+                name = name[: -len(".__main__")]
+            return cls((sys.executable, "-m", name), cwd)
+        script = sys.argv[0] if sys.argv else ""
+        if not script or not os.path.isfile(script):
+            return cls((), cwd, f"cannot start this program again: {script or 'no script'} is not a file")
+        if script.lower().endswith(".exe"):
+            return cls((script,), cwd)  # a console script's launcher on Windows
+        return cls((sys.executable, script), cwd)
+
+
+# -- Framing
+
+
+def _frame(kind: int, payload: bytes | dict = b"") -> bytes:
+    if isinstance(payload, dict):
+        payload = json.dumps(payload).encode()
+    if len(payload) >= _MAX_FRAME:
+        raise ValueError("frame too large")
+    return _HEADER.pack(len(payload) + 1, kind) + payload
+
+
+def _parse(buffer: bytearray) -> Iterator[tuple[int, bytes]]:
+    """Take the complete frames out of the start of buffer."""
+    while len(buffer) >= _HEADER.size:
+        length, kind = _HEADER.unpack_from(buffer)
+        if not 0 < length <= _MAX_FRAME:
+            raise _ProtocolError(f"bad frame length {length}")
+        end = _HEADER.size - 1 + length  # the length counts the type
+        if len(buffer) < end:
+            return
+        payload = bytes(buffer[_HEADER.size : end])
+        del buffer[:end]
+        yield kind, payload
+
+
+def _json(payload: bytes) -> dict:
+    try:
+        value = json.loads(payload.decode())
+    except (UnicodeDecodeError, ValueError):
+        raise _ProtocolError("bad message") from None
+    if not isinstance(value, dict):
+        raise _ProtocolError("bad message")
+    return value
+
+
+class _Channel:
+    """A socket that sends and receives frames, blocking or not."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.incoming = bytearray()
+        self.outgoing = bytearray()
+
+    # Blocking, for the handshake.
+
+    def write(self, kind: int, payload: bytes | dict = b"") -> None:
+        self.sock.sendall(_frame(kind, payload))
+
+    def read(self) -> tuple[int, bytes]:
+        while True:
+            for message in _parse(self.incoming):
+                return message
+            data = self.sock.recv(_CHUNK)
+            if not data:
+                raise EOFError("connection closed")
+            self.incoming += data
+
+    def expect(self, kind: int) -> bytes:
+        got, payload = self.read()
+        if got != kind:
+            raise _ProtocolError(f"unexpected message {got}")
+        return payload
+
+    # Non-blocking, once a command runs.
+
+    def queue(self, kind: int, payload: bytes | dict = b"") -> None:
+        if isinstance(payload, (bytes, bytearray)) and len(payload) > _CHUNK:
+            for i in range(0, len(payload), _CHUNK):
+                self.outgoing += _frame(kind, bytes(payload[i : i + _CHUNK]))
+        else:
+            self.outgoing += _frame(kind, payload)
+
+    def flush(self) -> None:
+        """Send what the socket takes now. Raises EOFError if the peer is gone."""
+        while self.outgoing:
+            try:
+                sent = self.sock.send(self.outgoing)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as e:
+                raise EOFError(e.strerror or "connection lost") from None
+            del self.outgoing[:sent]
+
+    def receive(self) -> list[tuple[int, bytes]]:
+        """
+        The frames that have arrived, those read along with an earlier
+        one included. Raises EOFError if the peer is gone.
+        """
+        try:
+            data = self.sock.recv(_CHUNK)
+        except (BlockingIOError, InterruptedError):
+            data = None
+        except OSError as e:
+            raise EOFError(e.strerror or "connection lost") from None
+        if data is not None:
+            if not data:
+                raise EOFError
+            self.incoming += data
+        return list(_parse(self.incoming))
+
+
+def _printable(text: str) -> str:
+    """
+    Text for a log line, with what a terminal or a log reader would act
+    on shown escaped instead: control characters, C1 ones and Unicode's
+    line separators and direction overrides among them. A tab stays.
+    """
+    return "".join(c if c.isprintable() or c == "\t" else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
+def _refuse(sock: socket.socket, message: str, code: int) -> None:
+    """Tell a client it is refused, on a socket with no session, and close it."""
+    try:
+        sock.sendall(_frame(REFUSED, {"message": message, "code": code}))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+def _mac(password: str, side: str, server_nonce: bytes, client_nonce: bytes) -> str:
+    """The proof that a side, client or server, knows the password: each proves it on a text of its own."""
+    text = side.encode() + b"\0" + server_nonce + client_nonce
+    return hmac.new(password.encode(), text, hashlib.sha256).hexdigest()
+
+
+def _proves(mac: Any, expected: str) -> bool:
+    return isinstance(mac, str) and hmac.compare_digest(mac.encode(), expected.encode())
+
+
+def _nonce(text: Any) -> bytes:
+    try:
+        nonce = bytes.fromhex(text)
+    except (TypeError, ValueError):
+        raise _ProtocolError("bad nonce") from None
+    if len(nonce) < 16:
+        raise _ProtocolError("bad nonce")
+    return nonce
+
+
+def _integer(message: dict, key: str, default: int) -> int:
+    value = message.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _ProtocolError(f"bad {key}")
+    return value
+
+
+def _keep_alive(sock: socket.socket) -> None:
+    """Have the system notice a peer that vanished without a word, such as a computer gone to sleep."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for name, value in _KEEPALIVE:
+        option = getattr(socket, name, None)
+        if option is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+            except OSError:
+                pass
+
+
+def _set_size(fd: int, size: Any) -> None:
+    try:
+        rows, cols = int(size["rows"]), int(size["cols"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if not (0 <= rows < 65536 and 0 <= cols < 65536):
+        return
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def _watch(selector: selectors.BaseSelector, fileobj: Any, events: int) -> None:
+    """Make selector watch fileobj for events, or not at all for none."""
+    try:
+        key = selector.get_key(fileobj)
+    except KeyError:
+        key = None
+    if not events:
+        if key is not None:
+            selector.unregister(fileobj)
+    elif key is None:
+        selector.register(fileobj, events)
+    elif key.events != events:
+        selector.modify(fileobj, events)
+
+
+# -- The server
+
+
+class _PlainFormatter(logging.Formatter):
+    """Log lines as a command-line tool prints them: ``prog: warning: ...``."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__("%(message)s")
+        self.prog = prog
+
+    def format(self, record: logging.LogRecord) -> str:
+        level = f"{record.levelname.lower()}: " if record.levelno >= logging.WARNING else ""
+        return f"{self.prog}: {level}{super().format(record)}"
+
+
+def _listening_address(bind: str, port: int) -> tuple[int, Any]:
+    """
+    The address family and address to listen on for --bind, which may be
+    an IPv4 or IPv6 address or a name. A name is taken as IPv4 where it
+    has both, as localhost does, since a client tries every address.
+    """
+    try:
+        found = socket.getaddrinfo(bind, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as e:
+        raise RemoteError(f"cannot listen on {_endpoint(bind, port)}: {e.strerror or e}") from None
+    found.sort(key=lambda entry: entry[0] != socket.AF_INET)
+    family, _, _, _, address = found[0]
+    return family, address
+
+
+def _is_loopback(address: Any) -> bool:
+    try:
+        return ipaddress.ip_address(address[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _plain_logging(prog: str, debug: bool) -> None:
+    """Have the server's logger print plain lines to stderr, unless the program has set up logging."""
+    if logging.getLogger().handlers or logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_PlainFormatter(prog))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.propagate = False
+
+
+def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog: str, variable: str, port: Any,
+          password: Any, bind: Any, debug: bool) -> None:
+    """Run the server until interrupted.
+
+    It logs through the ``fireaid.remote`` logger. A program that has not
+    set up logging gets plain lines on stderr.
+
+    Commands run one at a time, in this thread. Clients log in in threads
+    of their own, so that one that is slow to log in keeps no other out,
+    and one that logs in while a command runs is told the server is busy.
+    """
+    _plain_logging(prog, debug)
+    if launch.error:
+        raise RemoteError(launch.error)
+    if password == "True":
+        # Fire gives a flag without a value the text True, as for a boolean.
+        raise RemoteError("--password needs a value", 2)
+    secret = password_variable(prog)
+    if password is None:
+        password = os.environ.get(secret) or None
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536:
+        raise RemoteError(f"{port!r} is not a port", 2)
+
+    if not isinstance(bind, str) or not bind:
+        raise RemoteError(f"{bind!r} is not an address to bind to", 2)
+    family, address = _listening_address(bind, port)
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows: there SO_REUSEADDR would let another program bind the port
+        # while the server listens on it, and take its clients.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # restart at once on the same port
+    try:
+        listener.bind(address)
+        listener.listen(5)
+    except OSError as e:
+        listener.close()
+        raise RemoteError(f"cannot listen on {_endpoint(*address[:2])}: {e.strerror or e}") from None
+    address = listener.getsockname()  # with the port given for 0
+
+    def stop(_sig, _frame):
+        raise SystemExit(0)
+
+    handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
+    notes = "" if password is not None else ", no password"
+    notes += "" if _pty_available() else ", commands get pipes"
+    logger.info(f"serving on {_endpoint(*address[:2])}{notes}")
+    if password is None:
+        logger.warning(f"anyone who can reach the port may run commands; --password or {secret} adds HMAC "
+                       "challenge-response authentication (mild security)")
+    if not _is_loopback(address):
+        logger.warning("the command server is unencrypted, do not use over untrusted networks; "
+                       "--bind 127.0.0.1 restricts access to localhost")
+    logger.debug(f"starting {' '.join(launch.prefix)} in {launch.cwd} for each command")
+
+    hidden = (variable, secret)  # what the commands do not get from the server's environment
+    ready: queue.Queue = queue.Queue()  # sessions logged in, whose command is to run
+    busy = threading.Lock()  # held from reserving the server until the command has run
+    logins = threading.BoundedSemaphore(_MAX_HANDSHAKES)  # clients still logging in
+    waiting = threading.BoundedSemaphore(_MAX_WAITING)  # clients logged in, waiting for the server
+    stopping = threading.Event()
+
+    def admit(sock: socket.socket, peer: Any) -> None:
+        session = _Session(sock, peer, launch, deny, allow, hidden, password)
+        try:
+            try:
+                pending = session.log_in()
+            finally:
+                logins.release()  # the slot is for logging in, not for waiting to run
+            if pending and session.reserve(busy, waiting):
+                ready.put(session)
+                return
+        except Exception as e:  # one client must not stop the server
+            logger.error(f"{peer[0]}: {_printable(str(e))}")
+        session.close()
+
+    def accept() -> None:
+        listener.settimeout(_TICK)
+        while not stopping.is_set():
+            try:
+                sock, peer = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return  # the listener is closed
+            logger.debug(f"{peer[0]}:{peer[1]} connected")
+            if not logins.acquire(blocking=False):
+                logger.info(f"{peer[0]}: turned away, {_MAX_HANDSHAKES} clients are logging in")
+                _refuse(sock, "the server has too many clients logging in; try again shortly", 1)
+                continue
+            try:
+                threading.Thread(target=admit, args=(sock, peer), daemon=True).start()
+            except RuntimeError:  # no thread to be had: the client is told, and the server goes on
+                logins.release()
+                _refuse(sock, "the server is overloaded; try again shortly", 1)
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        while True:
+            try:
+                session = ready.get(timeout=1.0)  # so that Ctrl-C gets through on Windows
+            except queue.Empty:
+                continue
+            try:
+                session.run()
+            except Exception as e:  # one client must not stop the server
+                logger.error(f"{session.peer}: {_printable(str(e))}")
+            finally:
+                busy.release()
+                session.close()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stopping.set()
+        listener.close()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+class _Session:
+    """One client, one command."""
+
+    def __init__(self, sock: socket.socket, peer: Any, launch: Launch, deny: Sequence[str],
+                 allow: Sequence[str] | None, hidden: Sequence[str], password: str | None) -> None:
+        self.channel = _Channel(sock)
+        self.address = peer
+        self.peer = peer[0]
+        self.launch = launch
+        self.deny = deny
+        self.allow = allow
+        self.hidden = hidden
+        self.password = password
+        self.request: dict = {}
+
+    def log_in(self) -> bool:
+        """
+        Log the client in and take its command line, in a thread of its
+        own. Returns whether there is a command to run, then held in
+        self.request. This is the one step the login slots limit, so it
+        does not wait for the server to be free; reserve does that.
+        """
+        _keep_alive(self.channel.sock)
+        self.channel.sock.settimeout(_HANDSHAKE_TIMEOUT)
+        try:
+            request = self.handshake()
+        except _ProtocolError as e:
+            self.refuse(str(e), 2)
+            return False
+        except (OSError, EOFError) as e:
+            logger.debug(f"{self.peer}: gone during the handshake: {_printable(str(e))}")
+            return False
+        if request is None:
+            return False
+        self.request = request
+        return True
+
+    def reserve(self, busy: threading.Lock, waiting: threading.BoundedSemaphore) -> bool:
+        """
+        Take the run lock for this command, waiting a moment for it among
+        a bounded number of others, or tell the client the server is busy.
+        """
+        if not waiting.acquire(blocking=False):
+            self.refuse("the server has too many clients waiting; try again later", 1)
+            return False
+        try:
+            if busy.acquire(blocking=False):
+                return True
+            # A command ending, such as one whose client has gone, takes a moment.
+            logger.debug(f"{self.peer} waits for the command running now")
+            if busy.acquire(timeout=_BUSY_WAIT):
+                return True
+        finally:
+            waiting.release()
+        self.refuse("busy with another client's command; try again later", 1)
+        return False
+
+    def run(self) -> None:
+        request = self.request
+        argv = request["argv"]
+        terminals = "".join("1" if x else "0" for x in request["tty"])
+        # A flag's value may be a secret, such as a password: the whole line is for debugging only.
+        words = list(itertools.takewhile(lambda w: not w.startswith("-"), argv))
+        more = " ..." if len(words) < len(argv) else ""
+        # The words are the client's; control characters in them neither move
+        # the operator's cursor nor forge a line of their own in the log.
+        logger.info(f"{self.peer} runs: {_printable(shlex.join(words)) or '(flags)'}{more}")
+        logger.debug(f"as: {_printable(shlex.join([*self.launch.prefix, *argv]))} in {self.launch.cwd}; "
+                     f"tty {terminals}, size {request.get('size')}, env {_printable(str(request['env']))}")
+        self.channel.sock.setblocking(False)
+        runner = _PtyCommand if _pty_available() else _PipeCommand
+        started = time.monotonic()
+        code = runner(self.channel, self.launch, request, self.hidden).run()
+        seconds = time.monotonic() - started
+        if code is None:
+            logger.info(f"{self.peer} went away after {seconds:.1f} s; the command was ended")
+        else:
+            logger.info(f"{self.peer} done: exit {code} after {seconds:.1f} s")
+
+    def close(self) -> None:
+        self.channel.sock.close()
+        logger.debug(f"{self.address[0]}:{self.address[1]} done")
+
+    def refuse(self, message: str, code: int) -> None:
+        logger.info(f"{self.peer}: {_printable(message)}")  # a refusal may quote what the client sent
+        try:
+            self.channel.write(REFUSED, {"message": message, "code": code})
+        except OSError:
+            pass
+
+    def handshake(self) -> dict | None:
+        channel = self.channel
+        nonce = secrets.token_bytes(32)
+        channel.write(CHALLENGE, {"proto": PROTOCOL, "nonce": nonce.hex(), "auth": self.password is not None,
+                                  "pty": _pty_available()})
+
+        hello = _json(channel.expect(HELLO))
+        if hello.get("proto") != PROTOCOL:
+            self.refuse(f"this server speaks fireaid remote protocol {PROTOCOL}, "
+                        f"the client {hello.get('proto')}", 1)
+            return None
+        if self.password is None:
+            channel.write(AUTH_OK)
+        else:
+            auth = _json(channel.expect(AUTH))
+            theirs = _nonce(auth.get("nonce"))
+            if not _proves(auth.get("mac"), _mac(self.password, "client", nonce, theirs)):
+                self.refuse("authentication failed", 1)
+                return None
+            channel.write(AUTH_OK, {"mac": _mac(self.password, "server", nonce, theirs)})
+
+        request = _json(channel.expect(RUN))
+        argv = request.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(w, str) for w in argv):
+            raise _ProtocolError("bad command line")
+        flags = request.get("tty")
+        if not isinstance(flags, list) or len(flags) != 3:
+            raise _ProtocolError("bad terminal description")
+        env = request.get("env") or {}
+        if not isinstance(env, dict):
+            raise _ProtocolError("bad environment")
+        request["env"] = {k: v for k, v in env.items() if k in TERMINAL_VARIABLES and isinstance(v, str)}
+
+        reason = refusal(argv, self.deny, self.allow)
+        if reason:
+            self.refuse(reason, 2)
+            return None
+        return request
+
+
+def _environment(request: dict, hidden: Sequence[str]) -> dict:
+    # The client's terminal variables replace ours. The program's own
+    # --remote variable would send the command on again, and the server's
+    # password is the server's.
+    env = {k: v for k, v in os.environ.items() if k not in TERMINAL_VARIABLES and k not in hidden}
+    env.update(request["env"])
+    env[CHILD_VARIABLE] = "1"
+    return env
+
+
+def _exit_code(returncode: int) -> int:
+    """A child's return code as the client's exit code."""
+    if returncode < 0:
+        return 128 - returncode  # ended by a signal
+    if returncode == _CONTROL_C_EXIT:
+        return 128 + signal.SIGINT
+    return returncode if returncode < 256 else 1
+
+
+def _interrupt(process: subprocess.Popen, name: str) -> None:
+    """Send the signal of that name to the command, and what it started."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            # The nearest thing: the child is its own process group.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        elif name in _SIGNALS:
+            os.killpg(process.pid, _SIGNALS[name])
+    except OSError:
+        pass
+
+
+def _kill(process: subprocess.Popen | None) -> None:
+    """End the command, and what it started, as its client has gone."""
+    if process is None or process.poll() is not None:
+        return
+    logger.debug("client gone, ending the command")
+    if os.name == "nt":
+        steps = ((process.terminate, 2.0), (process.kill, None))
+    else:
+        steps = ((lambda: os.killpg(process.pid, signal.SIGHUP), 2.0),
+                 (lambda: os.killpg(process.pid, signal.SIGKILL), None))
+    for step, wait in steps:
+        try:
+            step()
+        except OSError:
+            pass
+        try:
+            process.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _send_exit(channel: _Channel, returncode: int) -> int:
+    """Send the command's exit code to the client, and return it."""
+    code = _exit_code(returncode)
+    if code != returncode:
+        logger.debug(f"command returned {returncode}, client gets {code}")
+    channel.queue(EXIT, {"code": code})
+    sock = channel.sock
+    sock.setblocking(True)
+    sock.settimeout(_HANDSHAKE_TIMEOUT)
+    try:
+        sock.sendall(channel.outgoing)
+    except OSError:
+        pass
+    return code
+
+
+# What a command with a terminal starts through: a bare interpreter that
+# makes the terminal among its stdio the controlling one, then becomes
+# the program. The server has threads, its logins, and what runs in a
+# forked child before it execs can deadlock on a lock one of them held:
+# Python says so of preexec_fn. This way nothing of the server's runs
+# there, at the cost of an interpreter start of some 20 ms.
+_TAKE_TERMINAL = (
+    sys.executable, "-I", "-S", "-c",
+    "import fcntl, os, sys, termios\n"
+    "for fd in (0, 1, 2):\n"
+    "    if os.isatty(fd):\n"
+    "        try:\n"
+    "            fcntl.ioctl(fd, termios.TIOCSCTTY, 0)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        break\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])",
+)
+
+
+class _Command:
+    """
+    A command line running in a child process, relayed to the client.
+
+    Each kind of command spawns its process, relays until it is done,
+    releases its stdio however the run ended, feeds it the client's
+    input and resizes its terminal in its own way.
+
+    The client sends input only as the server asks for it, so that what
+    the command has yet to read stays within _BACKLOG: the server asks
+    for more as the command takes it, and counts it in consumed.
+    """
+
+    def __init__(self, channel: _Channel, launch: Launch, request: dict, hidden: Sequence[str]) -> None:
+        self.channel = channel
+        self.launch = launch
+        self.request = request
+        self.hidden = hidden
+        self.process: subprocess.Popen | None = None
+        self.allowed = 0  # input the client may still send
+        self.consumed = 0  # input taken by the command, or dropped, and not asked for again yet
+
+    def run(self) -> int | None:
+        """Run the command. Returns the client's exit code, or None if the client went away."""
+        try:
+            self.spawn()
+            self.ask_for_input(_BACKLOG)
+            try:
+                self.relay()
+            except (EOFError, ConnectionError, _ProtocolError):
+                _kill(self.process)
+                return None
+        except BaseException:
+            _kill(self.process)
+            raise
+        finally:
+            self.release()
+        return _send_exit(self.channel, self.process.wait())
+
+    def popen(self, through: Sequence[str] = (), **options: Any) -> None:
+        """Start the command, through a bootstrap that execs it if given."""
+        self.process = subprocess.Popen(
+            [*through, *self.launch.prefix, *self.request["argv"]],
+            cwd=self.launch.cwd,
+            env=_environment(self.request, self.hidden),
+            **options,
+        )
+
+    def ask_for_input(self, size: int) -> None:
+        self.allowed += size
+        self.channel.queue(CREDIT, {"bytes": size})
+
+    def ask_for_more_input(self) -> None:
+        if self.consumed >= _CHUNK:
+            self.ask_for_input(self.consumed)
+            self.consumed = 0
+
+    def on_message(self, kind: int, payload: bytes) -> None:
+        if kind == STDIN:
+            if len(payload) > self.allowed:
+                raise _ProtocolError("more input than the server asked for")
+            self.allowed -= len(payload)
+            self.feed(payload)
+        elif kind == STDIN_EOF:
+            self.feed(None)
+        elif kind == WINCH:
+            self.resize(payload)
+        elif kind == SIGNAL:
+            _interrupt(self.process, str(_json(payload).get("name")))
+        else:
+            raise _ProtocolError(f"unexpected message {kind}")
+
+    def resize(self, payload: bytes) -> None:
+        pass  # no terminal to resize
+
+
+class _PtyCommand(_Command):
+    """A command with a pseudo-terminal for what is a terminal at the client."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.outputs: dict[int, int] = {}  # fd -> message type
+        self.master: int | None = None
+        self.stdin: int | None = None  # where the client's input goes
+        self.stdin_is_pipe = False
+        self.pending = bytearray()
+        self.stdin_eof = False
+
+    def spawn(self) -> None:
+        stdin_tty, stdout_tty, stderr_tty = (bool(x) for x in self.request["tty"])
+        child: list[int] = [0, 0, 0]
+        close: list[int] = []
+        slave = None
+        if stdin_tty or stdout_tty or stderr_tty:
+            self.master, slave = os.openpty()
+            close.append(slave)
+            if self.request.get("size"):
+                _set_size(self.master, self.request["size"])
+            if not self.request.get("raw"):
+                # The client's terminal turns newlines into CR LF itself.
+                attrs = termios.tcgetattr(slave)
+                attrs[1] &= ~termios.OPOST
+                termios.tcsetattr(slave, termios.TCSANOW, attrs)
+            self.outputs[self.master] = TTY
+
+        if stdin_tty:
+            child[0] = slave
+            self.stdin = self.master
+        else:
+            r, w = os.pipe()
+            child[0] = r
+            close.append(r)
+            self.stdin, self.stdin_is_pipe = w, True
+
+        if stdout_tty:
+            child[1] = slave
+        else:
+            r, w = os.pipe()
+            child[1] = w
+            close.append(w)
+            self.outputs[r] = STDOUT
+
+        if stderr_tty:
+            child[2] = slave
+        elif self.request.get("same"):
+            child[2] = child[1]  # 2>&1 on the client: one stream, in order
+        else:
+            r, w = os.pipe()
+            child[2] = w
+            close.append(w)
+            self.outputs[r] = STDERR
+
+        try:
+            self.popen(
+                through=_TAKE_TERMINAL if slave is not None else (),
+                stdin=child[0],
+                stdout=child[1],
+                stderr=child[2],
+                start_new_session=True,
+            )
+        finally:
+            for fd in close:
+                os.close(fd)
+        for fd in {*self.outputs, self.stdin}:
+            os.set_blocking(fd, False)
+
+    def release(self) -> None:
+        for fd in {*self.outputs, self.stdin} - {None}:
+            os.close(fd)
+
+    def relay(self) -> None:
+        channel = self.channel
+        selector = selectors.SelectSelector()
+        try:
+            while self.process.poll() is None:
+                _watch(selector, channel.sock,
+                       selectors.EVENT_READ | (selectors.EVENT_WRITE if channel.outgoing else 0))
+                for fd in {*self.outputs, self.stdin} - {None}:
+                    events = 0
+                    if fd in self.outputs and len(channel.outgoing) < _BACKLOG:
+                        events |= selectors.EVENT_READ
+                    if fd == self.stdin and self.pending:
+                        events |= selectors.EVENT_WRITE
+                    _watch(selector, fd, events)
+
+                for key, events in selector.select(_TICK):
+                    if key.fileobj is channel.sock:
+                        if events & selectors.EVENT_WRITE:
+                            channel.flush()
+                        continue
+                    fd = key.fd
+                    if events & selectors.EVENT_READ and fd in self.outputs:
+                        self.read_output(selector, fd)
+                    if events & selectors.EVENT_WRITE and fd == self.stdin:
+                        self.write_input()
+                for kind, payload in channel.receive():
+                    self.on_message(kind, payload)
+                self.close_input_if_done(selector)
+                self.ask_for_more_input()
+            # Done: what it wrote is in its outputs now. Something it left
+            # running may hold them open, and is not waited for.
+            self.drain(selector)
+        finally:
+            selector.close()
+
+    def read_output(self, selector: selectors.BaseSelector, fd: int) -> None:
+        try:
+            data = os.read(fd, _CHUNK)
+        except BlockingIOError:
+            return
+        except OSError:  # EIO: the terminal's last user has closed it
+            data = b""
+        if data:
+            self.channel.queue(self.outputs[fd], data)
+            return
+        self.close_output(selector, fd)
+
+    def drain(self, selector: selectors.BaseSelector) -> None:
+        """Pass on what the outputs hold, and close them."""
+        for fd in list(self.outputs):
+            for _ in range(_BACKLOG // _CHUNK):  # what writes on is cut short
+                try:
+                    data = os.read(fd, _CHUNK)
+                except OSError:  # nothing more now, or EIO
+                    break
+                if not data:
+                    break
+                self.channel.queue(self.outputs[fd], data)
+            self.close_output(selector, fd)
+
+    def close_output(self, selector: selectors.BaseSelector, fd: int) -> None:
+        _watch(selector, fd, 0)
+        kind = self.outputs.pop(fd)
+        if kind == TTY:
+            self.master = None
+            if self.stdin == fd:
+                self.stdin = None
+                self.drop_input()
+        os.close(fd)
+
+    def write_input(self) -> None:
+        try:
+            written = os.write(self.stdin, self.pending)
+        except BlockingIOError:
+            return
+        except OSError:  # nobody reads it any more
+            self.drop_input()
+            self.stdin_eof = True
+            return
+        del self.pending[:written]
+        self.consumed += written
+
+    def drop_input(self) -> None:
+        self.consumed += len(self.pending)
+        self.pending.clear()
+
+    def close_input_if_done(self, selector: selectors.BaseSelector) -> None:
+        if self.stdin_is_pipe and self.stdin is not None and self.stdin_eof and not self.pending:
+            _watch(selector, self.stdin, 0)
+            os.close(self.stdin)
+            self.stdin = None
+
+    def feed(self, data: bytes | None) -> None:
+        if data is None:
+            self.stdin_eof = True
+        elif self.stdin is not None and not self.stdin_eof:
+            self.pending += data
+        else:
+            self.consumed += len(data)
+
+    def resize(self, payload: bytes) -> None:
+        if self.master is not None:
+            _set_size(self.master, _json(payload))
+
+
+class _PipeCommand(_Command):
+    """
+    A command with pipes for its stdio.
+
+    For systems without pseudo-terminals, Windows above all, where pipes
+    cannot be watched together with the socket either: threads read the
+    command's output and write its input, the main loop minds the socket.
+    """
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.output: queue.Queue = queue.Queue(maxsize=64)  # (kind, data), data None at the end
+        self.input: queue.Queue = queue.Queue()  # data, None at the end
+        self.written: queue.Queue = queue.Queue()  # the sizes of the input taken
+        self.readers = 0
+        self.stopped = threading.Event()  # nobody relays the output any more
+
+    def spawn(self) -> None:
+        if os.name == "nt":
+            options: dict = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            options = {"start_new_session": True}
+        self.popen(
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if self.request.get("same") else subprocess.PIPE,
+            **options,
+        )
+        for pipe, kind in ((self.process.stdout, STDOUT), (self.process.stderr, STDERR)):
+            if pipe is not None:
+                self.readers += 1
+                threading.Thread(target=self.read, args=(pipe, kind), daemon=True).start()
+        threading.Thread(target=self.write, daemon=True).start()
+
+    def read(self, pipe: Any, kind: int) -> None:
+        try:
+            while True:
+                data = pipe.read1(_CHUNK)
+                if not data or not self.hand_over((kind, data)):
+                    break
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.hand_over((kind, None))
+            pipe.close()
+
+    def hand_over(self, item: tuple[int, bytes | None]) -> bool:
+        """Put item in the output queue, unless nobody relays any more. Returns whether it went."""
+        while not self.stopped.is_set():
+            try:
+                self.output.put(item, timeout=_TICK)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def write(self) -> None:
+        stdin = self.process.stdin
+        broken = False
+        while True:
+            data = self.input.get()
+            if data is None:
+                break
+            if not broken:
+                try:
+                    stdin.write(data)
+                    stdin.flush()
+                except (OSError, ValueError):
+                    broken = True  # nobody reads it any more: what comes is dropped
+            self.written.put(len(data))
+        try:
+            stdin.close()
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        self.stopped.set()
+        self.input.put(None)
+
+    def relay(self) -> None:
+        channel = self.channel
+        sock = channel.sock
+        quiet = None  # since when the command is done and its output has not come on
+        while self.readers or self.process.poll() is None:
+            came = False
+            while len(channel.outgoing) < _BACKLOG:
+                try:
+                    kind, data = self.output.get_nowait()
+                except queue.Empty:
+                    break
+                came = True
+                if data is None:
+                    self.readers -= 1
+                else:
+                    channel.queue(kind, data)
+            if self.process.poll() is None or came or len(channel.outgoing) >= _BACKLOG:
+                quiet = None
+            elif quiet is None:
+                quiet = time.monotonic()
+            elif time.monotonic() - quiet >= _LINGER:
+                break  # something the command left running holds its output open
+            _, writable, _ = select.select([sock], [sock] if channel.outgoing else [], [], _POLL)
+            if writable:
+                channel.flush()
+            for kind, payload in channel.receive():
+                self.on_message(kind, payload)
+            while True:
+                try:
+                    self.consumed += self.written.get_nowait()
+                except queue.Empty:
+                    break
+            self.ask_for_more_input()
+
+    def feed(self, data: bytes | None) -> None:
+        self.input.put(data)
+
+
+# -- The client
+
+
+def _same_file(a: int, b: int) -> bool:
+    if os.name == "nt":
+        return False  # pipes have no telling identity there
+    try:
+        sa, sb = os.fstat(a), os.fstat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            if os.name == "nt":
+                time.sleep(0.01)
+            else:
+                select.select([], [fd], [])
+            continue
+        view = view[written:]
+
+
+def connect(target: Target, timeout: float = _CONNECT_TIMEOUT) -> socket.socket:
+    """
+    A connection to the target, trying each of its addresses.
+
+    "No route to host" and its kin come and go while the network is still
+    finding a neighbour's hardware address, so those are retried within the
+    timeout. The error names every address and what went wrong with it.
+    """
+    try:
+        found = socket.getaddrinfo(target.host, target.port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise RemoteError(f"cannot reach {target}: {e.strerror or e}") from None
+    deadline = time.monotonic() + timeout
+    errors: dict[str, str] = {}
+    instant_unreachable = True  # every attempt failed with "no route" at once
+    while True:
+        transient = False
+        for family, kind, proto, _, address in found:
+            shown = f"[{address[0]}]" if family == socket.AF_INET6 else address[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock = socket.socket(family, kind, proto)
+            started = time.monotonic()
+            try:
+                sock.settimeout(remaining)
+                sock.connect(address)
+                # The handshake gets its own time, not what is left of the connect's.
+                sock.settimeout(_HANDSHAKE_TIMEOUT)
+                _keep_alive(sock)
+                return sock
+            except OSError as e:
+                sock.close()
+                errors[shown] = e.strerror or str(e)
+                number = getattr(e, "errno", None)
+                transient |= number in _TRANSIENT
+                instant_unreachable &= number == errno.EHOSTUNREACH and time.monotonic() - started < 0.05
+        if not transient or time.monotonic() + 0.5 > deadline:
+            break
+        time.sleep(0.5)
+    tried = "; ".join(f"{address}: {error}" for address, error in errors.items()) or "no address"
+    hint = ""
+    if errors and instant_unreachable and sys.platform == "darwin":
+        # macOS answers at once with "No route to host" for a program that
+        # may not use the local network, while ping still gets through.
+        hint = ("\nthis is what macOS says when the app running this has no Local Network permission: "
+                "System Settings > Privacy & Security > Local Network")
+    raise RemoteError(f"cannot reach {target}: {tried}{hint}")
+
+
+def _fill_closed_stdio() -> None:
+    """
+    Point stdin, stdout or stderr at the null device where it is closed,
+    as a daemon does. The client writes to them by number, and a socket
+    opened next would otherwise take the closed one's number, and get the
+    command's output written into it. With the null device there, output
+    to a closed stdout goes nowhere, as it would locally.
+    """
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            null = os.open(os.devnull, os.O_RDWR)
+            if null != fd:  # the lower ones are open, so it gets fd; should it not, move it there
+                os.dup2(null, fd)
+                os.close(null)
+
+
+def run_client(target: Target, argv: Sequence[str]) -> int:
+    """Run a command line on a server. Returns its exit code."""
+    _fill_closed_stdio()
+    sock = connect(target)
+    try:
+        return _Client(sock, target).run(list(argv))
+    finally:
+        sock.close()
+
+
+def _read_stdin(chunks: queue.Queue) -> None:
+    """Read stdin until its end, into a queue: b"" is the end."""
+    while True:
+        try:
+            data = os.read(0, _CHUNK)
+        except OSError:
+            data = b""
+        chunks.put(data)
+        if not data:
+            return
+
+
+class _Client:
+    def __init__(self, sock: socket.socket, target: Target) -> None:
+        self.channel = _Channel(sock)
+        self.target = target
+        self.code: int | None = None
+        self.signals: list[int] = []
+        self.last_interrupt: float | None = None
+        self.pty = True  # whether the server gives commands a terminal
+        self.terminal = 2  # the client's terminal, or stderr: where TTY output goes
+        self.raw = False  # whether the client's terminal passes keys on as they come
+        self.credit = 0  # the input the server has asked for
+        self.unsent = bytearray()  # input read, waiting for the server to ask for it
+        self.send_eof = False
+        self.escape = 1  # how far the keys typed are into Enter ~ .
+
+    def run(self, argv: list[str]) -> int:
+        try:
+            self.handshake()
+        except socket.timeout:
+            raise RemoteError(f"{self.target} does not answer") from None
+        except (_ProtocolError, OSError, EOFError) as e:
+            raise RemoteError(f"{self.target}: {e}") from None
+
+        flags = [os.isatty(fd) for fd in (0, 1, 2)]
+        self.terminal = next((fd for fd in (1, 2, 0) if flags[fd]), 2)
+        saved = None
+        handlers = {}
+
+        def note(sig, _frame):
+            self.signals.append(sig)
+
+        def leave(sig, _frame):
+            raise SystemExit(128 + sig)
+
+        try:
+            if flags[0] and self.pty and termios is not None and not _like_windows():
+                # The command's terminal on the server does the echoing and
+                # the line editing; this one passes the keys on as they come.
+                try:
+                    saved = termios.tcgetattr(0)
+                    tty.setraw(0, termios.TCSADRAIN)
+                except termios.error:
+                    saved = None
+            self.raw = saved is not None
+            request = {
+                "argv": argv,
+                "tty": flags,
+                "raw": self.raw,
+                "same": not flags[1] and not flags[2] and _same_file(1, 2),
+                "env": {k: os.environ[k] for k in TERMINAL_VARIABLES if k in os.environ},
+            }
+            size = self.size()
+            if size:
+                request["size"] = size
+
+            wanted = [(signal.SIGINT, note), (signal.SIGTERM, leave)]
+            for name, handler in (("SIGWINCH", note), ("SIGHUP", leave)):
+                if hasattr(signal, name):
+                    wanted.append((getattr(signal, name), handler))
+            for sig, handler in wanted:
+                try:
+                    handlers[sig] = signal.signal(sig, handler)
+                except (ValueError, OSError):  # not the main thread
+                    pass
+
+            self.channel.write(RUN, request)
+            self.channel.sock.setblocking(False)
+            return self.relay()
+        finally:
+            if saved is not None:
+                termios.tcsetattr(0, termios.TCSADRAIN, saved)
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+
+    def size(self) -> dict | None:
+        try:
+            columns, lines = os.get_terminal_size(self.terminal)
+        except OSError:
+            return None
+        return {"cols": columns, "rows": lines}
+
+    def handshake(self) -> None:
+        channel = self.channel
+        kind, payload = channel.read()
+        if kind == REFUSED:  # the server turned us away before the challenge
+            self.refused(payload)
+        if kind != CHALLENGE:
+            raise _ProtocolError(f"unexpected message {kind}")
+        challenge = _json(payload)
+        if challenge.get("proto") != PROTOCOL:
+            raise RemoteError(f"{self.target} speaks fireaid remote protocol {challenge.get('proto')}, "
+                              f"this client speaks {PROTOCOL}")
+        self.pty = bool(challenge.get("pty", True))
+        auth = bool(challenge.get("auth"))
+        if not auth and self.target.password is not None:
+            # A server that does not know the password may not be the one meant.
+            raise RemoteError(f"{self.target} asks for no password, so the command is not sent to it")
+        channel.write(HELLO, {"proto": PROTOCOL})
+        if auth:
+            password = self.target.password or ""
+            theirs, ours = _nonce(challenge.get("nonce")), secrets.token_bytes(32)
+            channel.write(AUTH, {"mac": _mac(password, "client", theirs, ours), "nonce": ours.hex()})
+        kind, payload = channel.read()
+        if kind == REFUSED:
+            self.refused(payload)
+        if kind != AUTH_OK:
+            raise _ProtocolError(f"unexpected message {kind}")
+        if auth and not _proves(_json(payload).get("mac"), _mac(password, "server", theirs, ours)):
+            raise RemoteError(f"{self.target} does not know the password, so the command is not sent to it")
+
+    def refused(self, payload: bytes) -> None:
+        message = _json(payload)
+        raise RemoteError(f"{self.target}: {message.get('message')}", _integer(message, "code", 1))
+
+    def relay(self) -> int:
+        channel = self.channel
+        sock = channel.sock
+        threaded = _like_windows()  # stdin cannot be selected on Windows
+        chunks: queue.Queue = queue.Queue(maxsize=4)  # the thread waits while the server does
+        if threaded:
+            threading.Thread(target=_read_stdin, args=(chunks,), daemon=True).start()
+        reading_stdin = True
+
+        def wanted() -> bool:
+            """Whether to read stdin: the server has asked for input, and what was read has gone."""
+            return reading_stdin and self.credit > 0 and not self.unsent and len(channel.outgoing) < _BACKLOG
+
+        try:
+            while self.code is None:
+                self.handle_signals()
+                stdin = [0] if wanted() and not threaded else []
+                readable, writable, _ = select.select(
+                    [sock, *stdin], [sock] if channel.outgoing else [], [], _POLL if threaded else _TICK)
+                if sock in writable:
+                    channel.flush()
+                for kind, payload in channel.receive():
+                    self.on_message(kind, payload)
+                if 0 in readable:
+                    try:
+                        data = os.read(0, _CHUNK)
+                    except OSError:
+                        data = b""
+                    reading_stdin = self.take_input(data)
+                self.send_input()
+                while threaded and wanted():
+                    try:
+                        data = chunks.get_nowait()
+                    except queue.Empty:
+                        break
+                    reading_stdin = self.take_input(data)
+                    self.send_input()
+                channel.flush()
+        except EOFError as e:
+            raise RemoteError(f"{self.target}: {str(e) or 'connection closed'}") from None
+        except _ProtocolError as e:
+            raise RemoteError(f"{self.target}: {e}") from None
+        except BrokenPipeError:
+            # Our own output has gone away. The server stops the command.
+            return 128 + getattr(signal, "SIGPIPE", 13)
+        return self.code
+
+    def take_input(self, data: bytes) -> bool:
+        """
+        Take stdin's data, to send as the server asks for it. Returns
+        whether there is more to read. A terminal's end, Ctrl-D, goes on
+        as the end of the input: a raw one passes it on as a key instead.
+        """
+        if data:
+            if self.raw and self.escaped(data):
+                raise RemoteError(f"disconnected from {self.target}", 255)
+            self.unsent += data
+            return True
+        self.send_eof = True
+        return False
+
+    def escaped(self, keys: bytes) -> bool:
+        """
+        Whether the keys typed include Enter ~ . , the way out where Ctrl-C
+        is a key for the server's terminal, as in ssh.
+        """
+        for key in keys:
+            if self.escape == 2 and key == ord("."):
+                return True
+            self.escape = 2 if self.escape == 1 and key == ord("~") else int(key in b"\r\n")
+        return False
+
+    def send_input(self) -> None:
+        if self.unsent and self.credit > 0:
+            size = min(len(self.unsent), self.credit)
+            self.channel.queue(STDIN, bytes(self.unsent[:size]))
+            del self.unsent[:size]
+            self.credit -= size
+        if self.send_eof and not self.unsent:
+            self.channel.queue(STDIN_EOF)
+            self.send_eof = False
+
+    def handle_signals(self) -> None:
+        while self.signals:
+            sig = self.signals.pop(0)
+            if sig == getattr(signal, "SIGWINCH", None):
+                size = self.size()
+                if size:
+                    self.channel.queue(WINCH, size)
+            elif sig == signal.SIGINT:
+                now = time.monotonic()
+                if self.last_interrupt is not None and now - self.last_interrupt < 1.0:
+                    raise SystemExit(128 + signal.SIGINT)  # the second one is for us
+                self.last_interrupt = now
+                self.channel.queue(SIGNAL, {"name": "INT"})
+
+    def on_message(self, kind: int, payload: bytes) -> None:
+        if kind == STDOUT:
+            _write_all(1, payload)
+        elif kind == STDERR:
+            _write_all(2, payload)
+        elif kind == TTY:
+            _write_all(self.terminal, payload)
+        elif kind == EXIT:
+            self.code = _integer(_json(payload), "code", 1)
+        elif kind == CREDIT:
+            self.credit += max(0, _integer(_json(payload), "bytes", 0))
+        elif kind == REFUSED:
+            self.refused(payload)
+        else:
+            raise _ProtocolError(f"unexpected message {kind}")

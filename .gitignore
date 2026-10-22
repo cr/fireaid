@@ -4,7 +4,16 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-min/
 venv/
 Pipfile
 Pipfile.lock
 .pytest_cache/
+.vscode/
+docs/
+
+# private
+TODO.md
+.ruff_cache/
+.mypy_cache/
+.hypothesis/

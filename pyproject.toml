@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fireaid"
-version = "0.2.0"
-description = "Familiar help for command-line tools made with Python Fire"
+version = "0.3.0"
+description = "Familiar help, typed values and remote control for command-line tools made with Python Fire"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -13,13 +13,36 @@ license-files = ["LICENSE"]
 authors = [
     {name = "Christiane Ruetten", email = "cr@23bit.net"}
 ]
+keywords = ["fire", "cli", "command-line", "help", "remote control", "type hints"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: User Interfaces",
+]
 dependencies = [
-    "fire>=0.2.0"
+    "fire>=0.2.0",
+    # Fire before 0.7.0 imports pipes, which Python 3.13 removed.
+    "fire>=0.7.0; python_version >= '3.13'",
 ]
 
 [project.optional-dependencies]
 test = [
-    "pytest"
+    "colorama",  # what Fire strips colour with on Windows, to test against anywhere
+    "pytest",
+    "rich",  # for examples/progress.py
+    "ruff",
 ]
 
 [project.urls]
@@ -36,3 +59,21 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:fire",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# Errors, warnings, bugbear, unused arguments and imports, outdated syntax, import order.
+select = ["E", "F", "W", "B", "ARG", "UP", "I"]
+# The tests spell Optional[T] and quote a hint on purpose: what fireaid reads is the point.
+ignore = ["UP037", "UP045"]
+
+[tool.ruff.lint.per-file-ignores]
+# Signal handlers and stand-ins take arguments they do not use.
+"tests/*" = ["ARG"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fireaid"]
+known-local-folder = ["support"]

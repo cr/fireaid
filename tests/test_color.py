@@ -6,7 +6,7 @@ import re
 
 import pytest
 
-from test_terminal import run_on_terminal
+from support import run_on_terminal, unix
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 HEADING = "\x1b[1;94m{}\x1b[0m"
@@ -56,7 +56,9 @@ def test_help_colours(run):
     for heading in ("NAME", "SYNOPSIS", "DESCRIPTION", "POSITIONAL ARGUMENTS", "FLAGS"):
         assert "\n" + HEADING.format(heading) + "\n" in "\n" + out
     assert "    cli.py foo " + PLACEHOLDER.format("NAME") + " <flags>\n" in out
-    assert "    " + NAME.format("-c, --count") + "=" + PLACEHOLDER.format("COUNT") + "\n" in out
+    # Fire 0.5.0 and later name the short flag too.
+    flag = "-c, --count" if "-c, --count" in ANSI.sub("", out) else "--count"
+    assert "    " + NAME.format(flag) + "=" + PLACEHOLDER.format("COUNT") + "\n" in out
     assert "    cli.py foo - Foo doc.\n" in out
     # Only the headings are bold.
     assert out.count("\x1b[1;") == out.count("\x1b[1;94m") == 6
@@ -73,10 +75,15 @@ def test_help_colours_the_names_of_commands(run):
 
 
 def test_native_help_is_fires(run):
+    # Fire's own, where FORCE_COLOR has Fire colour it. On Windows Fire then
+    # strips that again from a pipe, and fireaid does not: the text is the same.
     for command in ("foo -- --help", "-- --help"):
-        assert run(command, FORCE_COLOR="1") == run(
-            command, module="fire", help=True, FORCE_COLOR="1"
-        )
+        ours = run(command, FORCE_COLOR="1")
+        fires = run(command, module="fire", help=True, FORCE_COLOR="1")
+        assert (ours.code, ANSI.sub("", ours.out), ANSI.sub("", ours.err)) == (
+            fires.code, ANSI.sub("", fires.out), ANSI.sub("", fires.err))
+        for colour in (HEADING, NAME, PLACEHOLDER, LABEL):
+            assert colour.split("{}")[0] not in ours.out + ours.err
 
 
 def test_no_color_wins(run):
@@ -85,11 +92,13 @@ def test_no_color_wins(run):
         assert "\x1b[" not in result.out + result.err
 
 
+@unix
 def test_colour_is_on_by_default_on_a_terminal():
     assert HEADING.format("Usage:") in run_on_terminal("", code=2, color=True)
     assert HEADING.format("NAME") in run_on_terminal("foo --help", color=True)
 
 
+@unix
 @pytest.mark.parametrize("term", ["vt100", "dumb", ""])
 def test_colour_is_off_on_a_terminal_without_colours(term):
     for command, code in (("", 2), ("foo --help", 0), ("nonesuch", 2)):
@@ -99,6 +108,7 @@ def test_colour_is_off_on_a_terminal_without_colours(term):
         assert "\x1b[92m" not in output and "\x1b[33m" not in output
 
 
+@unix
 @pytest.mark.parametrize("term", ["xterm", "linux", "a-terminal-of-the-future"])
 def test_colour_is_on_on_a_terminal_with_colours(term):
     assert HEADING.format("Usage:") in run_on_terminal("", code=2, color=True, term=term)
@@ -107,6 +117,32 @@ def test_colour_is_on_on_a_terminal_with_colours(term):
 def test_colour_is_off_when_output_is_redirected(run):
     result = run("foo --help")
     assert "\x1b[" not in result.out
+
+
+def test_colorama_does_not_strip_forced_colour(monkeypatch):
+    """On Windows, Fire has colorama strip colour from a pipe. FORCE_COLOR still has it."""
+    import io
+    import sys
+
+    import fire
+
+    import fireaid
+
+    colorama = pytest.importorskip("colorama")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    pipe = io.StringIO()
+    stripping = colorama.AnsiToWin32(pipe, strip=True, convert=False).stream
+    monkeypatch.setattr(sys, "stdout", stripping)
+
+    class Program:
+        def foo(self):
+            """Foo doc."""
+
+    with pytest.raises(fire.core.FireExit):
+        fireaid.Fire(Program, command="--help")
+    assert HEADING.format("NAME") in pipe.getvalue()
+    assert sys.stdout is stripping
 
 
 def test_fire_is_left_as_found_by_colour(monkeypatch, capsys):

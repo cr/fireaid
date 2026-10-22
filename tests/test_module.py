@@ -3,14 +3,20 @@ fireaid as a drop-in replacement of the fire module.
 """
 
 import importlib
+import importlib.util
 import inspect
 import os
+import sys
 from importlib import metadata
 
 import fire
 import pytest
 
 import fireaid
+
+# python -m fire, which python -m fireaid builds on, came with Fire 0.4.0.
+FIRE_MAIN = importlib.util.find_spec("fire.__main__") is not None
+needs_fire_main = pytest.mark.skipif(not FIRE_MAIN, reason="this Fire has no python -m fire")
 
 
 class Program:
@@ -23,7 +29,12 @@ def test_fire_is_wrapped():
     assert fireaid.Fire is not fire.Fire
     assert fireaid.Fire.__wrapped__ is fire.Fire
     assert fireaid.Fire.__doc__ == fire.Fire.__doc__
-    assert inspect.signature(fireaid.Fire) == inspect.signature(fire.Fire)
+    ours = inspect.signature(fireaid.Fire).parameters
+    theirs = inspect.signature(fire.Fire).parameters
+    # Fire's parameters, and remote, which is fireaid's.
+    assert list(ours.values())[:-1] == list(theirs.values())
+    assert ours["remote"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert ours["remote"].default is False
 
 
 def test_attributes_are_fires():
@@ -31,7 +42,7 @@ def test_attributes_are_fires():
     assert fireaid.decorators is fire.decorators
     assert set(dir(fire)) <= set(dir(fireaid))
     with pytest.raises(AttributeError):
-        fireaid.nonesuch
+        fireaid.nonesuch  # noqa: B018 - the access is the test
 
 
 def test_submodules_are_fires():
@@ -55,9 +66,20 @@ def test_version_is_our_own():
     assert fireaid.__version__ == metadata.version("fireaid")
 
 
+def test_import_leaves_the_version_for_later():
+    """importlib.metadata takes a noticeable part of a program's start: it waits for __version__."""
+    import subprocess
+    import sys
+
+    code = "import sys, fireaid; print('importlib.metadata' in sys.modules, fireaid.__version__ != 'unknown')"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out == "False True\n"
+
+
 def test_requirement_is_the_fire_with_plain_help():
     required = [r for r in metadata.requires("fireaid") if "extra ==" not in r]
-    assert required == ["fire>=0.2.0"]
+    # Fire before 0.7.0 does not import on Python 3.13 and later.
+    assert required == ["fire>=0.2.0", 'fire>=0.7.0; python_version >= "3.13"']
 
 
 @pytest.mark.parametrize(
@@ -139,6 +161,7 @@ def test_fire_is_left_as_found(command, capsys):
     assert fire.core.helptext is helptext
 
 
+@needs_fire_main
 def test_run_as_module(run_module):
     result = run_module("os.path join a b")
     assert result.code == 0
@@ -146,6 +169,7 @@ def test_run_as_module(run_module):
     assert result == run_module("os.path join a b", module="fire")
 
 
+@needs_fire_main
 def test_run_as_module_on_a_file(run_module):
     result = run_module("cli.py CLI foo x")
     assert result.code == 0
@@ -153,6 +177,7 @@ def test_run_as_module_on_a_file(run_module):
     assert result == run_module("cli.py CLI foo x", module="fire")
 
 
+@needs_fire_main
 def test_run_as_module_with_help(run_module):
     native = run_module("os.path join -- --help", module="fire")
     for command in ("os.path join --help", "os.path help join"):
@@ -162,10 +187,18 @@ def test_run_as_module_with_help(run_module):
         assert result.out == native.err
 
 
+@needs_fire_main
 def test_run_as_module_without_a_module(run_module):
     result = run_module("")
     assert result.code == 1
     assert result.out.startswith("usage: python -m fireaid")
+
+
+@pytest.mark.skipif(FIRE_MAIN, reason="this Fire has python -m fire")
+def test_run_as_module_needs_fire_main(run_module):
+    result = run_module("os.path join a b")
+    assert (result.code, result.out) == (1, "")
+    assert result.err == "python -m fireaid requires a Fire version with python -m fire\n"
 
 
 def test_help_command_in_native_syntax(capsys):
@@ -202,3 +235,107 @@ def test_component_that_cannot_take_a_help_command(capsys):
     with pytest.raises(fire.core.FireExit) as exit:
         fireaid.Fire([1, 2], command="help")
     assert exit.value.code == 0
+
+
+class Box:
+    """A box."""
+
+    def open(self):
+        return "opened"
+
+
+class Nesting:
+    def nested(self, x):
+        """Run a sub-tool, then return what has commands of its own."""
+        fireaid.Fire(Program, command=["foo"])
+        return Box()
+
+
+def test_fire_within_fire_leaves_the_outer_call_as_it_was(capsys):
+    """A command that runs a sub-tool through fireaid, and returns, still gets fireaid's help for its result."""
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Nesting, command="nested x --help", name="tool")
+    assert exit.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith("foo x\n")  # the sub-tool's result
+    assert "tool nested x - A box." in captured.out
+
+
+class Greeting:
+    def gruss(self, name="Welt"):
+        """Sagt Grüße."""
+        return f"Grüße, {name}"
+
+
+def test_help_with_stdout_closed(monkeypatch):
+    """With stdout closed, as cron or a daemon may run a tool, help is written nowhere, as print() would."""
+    monkeypatch.setattr(sys, "stdout", None)
+    for command in ("--help", "help gruss", ""):
+        with pytest.raises(fire.core.FireExit) as exit:
+            fireaid.Fire(Greeting, command=command, name="tool")
+        assert exit.value.code in (0, 2)
+
+
+def test_help_in_an_encoding_that_cannot_take_it(monkeypatch):
+    """What stdout's encoding cannot take is written escaped, as Python writes stderr, not a crash."""
+    import io
+
+    raw = io.BytesIO()
+    ascii_out = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", ascii_out)
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Greeting, command="gruss --help", name="tool")
+    assert exit.value.code == 0
+    assert "tool gruss - Sagt Gr\\xfc\\xdfe." in raw.getvalue().decode("ascii")
+
+
+def test_help_redirected_in_an_encoding_that_cannot_take_it(run):
+    """As tool --help > file does on Windows, where a redirected stdout takes the code page's encoding."""
+    result = run("gruss --help", component="Greeting", PYTHONIOENCODING="ascii")
+    assert (result.code, result.err) == (0, "")
+    assert "cli.py gruss - Sagt Gr\\xfc\\xdfe." in result.out
+
+
+def test_remote_config():
+    assert isinstance(fireaid._remote_config(True), fireaid.Remote)
+    assert fireaid._remote_config(False) is None
+    assert fireaid._remote_config(None) is None
+    with pytest.raises(TypeError):
+        fireaid._remote_config("boat")
+
+
+def test_fire_hook_points():
+    """
+    What fireaid stands in for while Fire runs, and what it reads from
+    Fire, by name and by the parameters it relies on. A Fire that renames
+    one fails here, not in a program.
+    """
+
+    def names(fn):
+        return list(inspect.signature(fn).parameters)
+
+    # Replaced while Fire runs.
+    assert names(fire.core._GetMember) == ["component", "args"]
+    assert names(fire.core._CallAndUpdateTrace)[:3] == ["component", "args", "component_trace"]
+    assert names(fire.core._Fire)[:2] == ["component", "args"]
+    assert names(fire.trace.FireTrace.AddAccessedProperty)[:4] == ["self", "component", "target", "args"]
+    assert len(names(fire.decorators.GetMetadata)) == 1
+    assert names(fire.core.Display) == ["lines", "out"]
+    for fn in (fire.core.helptext.HelpText, fire.core.helptext.UsageText):
+        assert names(fn) == ["component", "trace", "verbose"]
+    assert callable(fire.formatting.Bold) and callable(fire.formatting.Underline)
+    # Read from Fire.
+    assert "include_separators" in names(fire.trace.FireTrace.GetCommand)
+    assert callable(fire.trace.FireTrace.GetLastHealthyElement) and callable(fire.trace.FireTrace.HasError)
+    assert callable(fire.trace.FireTraceElement.HasCapacity)
+    assert all(isinstance(getattr(fire.trace, name), str)
+               for name in ("INITIAL_COMPONENT", "INSTANTIATED_CLASS", "ACCESSED_PROPERTY"))
+    assert isinstance(fire.decorators.FIRE_PARSE_FNS, str) and isinstance(fire.decorators.FIRE_METADATA, str)
+    assert callable(fire.parser.DefaultParseValue)
+    assert issubclass(fire.core.FireExit, SystemExit) and len(names(fire.core.FireExit.__init__)) == 3  # code, trace
+    # Noted in a trace by fireaid: the element's action and component, and the separator.
+    trace = fire.trace.FireTrace(initial_component=None)
+    element = trace.elements[-1]
+    assert element._action == fire.trace.INITIAL_COMPONENT and hasattr(element, "component")
+    assert hasattr(trace, "separator") and hasattr(trace, "show_help")

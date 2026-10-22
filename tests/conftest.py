@@ -1,12 +1,10 @@
-import os
 import subprocess
 import sys
-from pathlib import Path
 
 import fire
 import pytest
 
-TESTS = Path(__file__).parent
+from support import TESTS, environment
 
 
 def pytest_report_header(config):
@@ -27,15 +25,7 @@ class Result:
 
 
 def _run(argv, module="fireaid", component="CLI", help=False, **variables):
-    env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "FORCE_COLOR")}
-    env.update(
-        FIREAID_TEST_MODULE=module,
-        FIREAID_TEST_COMPONENT=component,
-        FIREAID_TEST_HELP="1" if help else "",
-        PAGER="cat",
-        COLUMNS="80",
-        **variables,
-    )
+    env = environment(module, component, FIREAID_TEST_HELP="1" if help else "", **variables)
     return Result(
         subprocess.run(
             [sys.executable, *argv],

@@ -2,9 +2,10 @@
 #
 #     git tag v0.2.0 && git push origin main v0.2.0
 #
-# PyPI accepts the upload from this workflow as a trusted publisher,
-# so there is no token. The pypi environment is where to require an
-# approval before anything is published.
+# The tag is tested as every push is, by the test workflow, on Linux,
+# macOS and Windows. PyPI accepts the upload from this workflow as a
+# trusted publisher, so there is no token. The pypi environment is where
+# to require an approval before anything is published.
 
 name: Publish
 
@@ -12,22 +13,17 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.9", "3.x"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-      - run: make test PYTHON=python
+    uses: ./.github/workflows/test.yml
 
   build:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -48,9 +44,10 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write  # for PyPI's trusted publishing; replaces the read-only default
     steps:
       - uses: actions/download-artifact@v8
         with:

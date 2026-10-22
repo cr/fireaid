@@ -2,55 +2,9 @@
 On a terminal, Fire pages its help. fireaid prints it like other tools.
 """
 
-import os
-import pty
-import subprocess
-import sys
-from pathlib import Path
+from support import run_on_terminal, unix
 
-TESTS = Path(__file__).parent
-
-# Fire runs $PAGER in a shell. This one marks every line it is given.
-PAGER = "sed s/^/PAGED:/"
-
-
-def run_on_terminal(
-    command, module="fireaid", code=0, component="CLI", color=False, term="xterm-256color"
-):
-    """Run the test program with a terminal as stdin, stdout and stderr."""
-    master, slave = pty.openpty()
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "cli.py", *command.split()],
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            env=dict(
-                {k: v for k, v in os.environ.items() if k != "FORCE_COLOR"},
-                FIREAID_TEST_MODULE=module,
-                FIREAID_TEST_COMPONENT=component,
-                PAGER=PAGER,
-                NO_COLOR="" if color else "1",
-                TERM=term,
-            ),
-            cwd=TESTS,
-        )
-    finally:
-        os.close(slave)
-    output = b""
-    try:
-        while True:
-            try:
-                chunk = os.read(master, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            output += chunk
-    finally:
-        os.close(master)
-    assert process.wait() == code
-    return output.decode().replace("\r\n", "\n")
+pytestmark = unix
 
 
 def test_fire_pages_help():
