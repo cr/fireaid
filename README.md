@@ -1,6 +1,6 @@
 # fireaid
 
-*A colorful little help for Python Fire.*
+*Familiar help, typed values and remote control for Python Fire.*
 
 [Python Fire](https://pypi.org/project/fire/) turns any Python
 function, class or module into a command-line tool with a single line
@@ -8,6 +8,9 @@ of code. `fireaid` is a thin wrapper around it that adds the help
 conventions people know from tools like `git`: a `help` command,
 `--help` printed straight to the terminal, a short usage message when
 a command is incomplete, and colour that makes it all easy to read.
+It gives parameters the values their type hints say, where Fire takes
+every value for a Python literal, and a program that asks for it with
+`remote=True`, and only then, can run its commands on another computer.
 Everything else is Fire, unchanged.
 
 All you need is:
@@ -118,7 +121,8 @@ fireaid additionally supports Git-style help:
 commands in the usage text and in the help, and `tool help help` shows
 help for it.
 To that end, fireaid adds the command to the program for as long as
-Fire runs: to its class, or to a copy if the program is a dict.
+Fire runs: to its class, to a module as an attribute, or to a copy if
+the program is a dict.
 
 A program that is a class, as in `fire.Fire(MyTool)`, gets the help of
 an instance. Fire does not instantiate a class to show its help, and so
@@ -163,15 +167,27 @@ flags may come anywhere, fireaid leaves it out.
 ## Colour
 
 On a terminal, fireaid colours the usage text and the help it prints:
-headings light blue and bold, the names of commands and flags light green, and
-placeholders for argument values yellow. Output that is redirected
-stays plain, as does output to a terminal that has no colours
-according to `TERM`, and everything with `NO_COLOR` set. `FORCE_COLOR`
-switches colour on regardless. Help in Fire's native syntax looks as
-Fire makes it.
+headings light blue and bold, the names of commands and flags light
+green, and placeholders for argument values yellow. Output that is
+redirected stays plain, as does output to a terminal that has no
+colours according to `TERM`, and everything with `NO_COLOR` set.
+`FORCE_COLOR` switches colour on regardless. Help in Fire's native
+syntax looks as Fire makes it.
 
-`examples/pantry.py` is a small program to try all of this on, and
-`examples/tour.sh` runs through it.
+## Examples
+
+`examples/pantry.py` is a small program to try the help, the usage
+text and the colour on, and `examples/tour.sh` runs through it.
+
+`examples/reminders.py` takes dates, times, durations, an `Enum` and
+numbers by their type hints, and `examples/hints_tour.sh` shows what
+each gives, and the usage errors for what does not fit.
+
+`examples/lamp.py` is remote controlled, and allows the commands that
+run remotely, so that its firmware command stays local.
+`examples/remote_tour.sh` runs a server for it on this computer, and
+commands through it, after showing that `pantry.py`, which does not ask
+for remote control, has none.
 
 `examples/progress.py` is a template for a tool that does longer work:
 log lines in colour and a progress bar on a terminal, plain lines
@@ -179,8 +195,17 @@ everywhere else, drawn by [rich](https://pypi.org/project/rich/).
 
 ## Remote control
 
-A program can be run on another computer, such as the one its hardware
-is plugged into:
+**Remote control is off unless the program turns it on, in its own
+call of `fire.Fire`, with `remote=True` or a `fireaid.Remote`.** Without
+that, nothing of it exists: there is no `server` command, `--remote` and
+`TOOL_REMOTE` are a flag and a variable like any other, left to the
+program, and the code for remote control is not even imported. No flag,
+environment variable or setting turns it on from outside the program,
+and in it only `True` or a `fireaid.Remote` does: anything else that
+might pass for yes, such as `1` or `"yes"`, is an error.
+
+A program can then be run on another computer, such as the one its
+hardware is plugged into:
 
     fire.Fire(MyTool, remote=True)
 
@@ -190,10 +215,6 @@ adds a `server` command, which serves the program's commands:
     tool server --port 4247 --password secret
     tool server --bind 127.0.0.1
 
-The variable `TOOL_SERVER_PASSWORD` gives the password where `--password`
-does not, keeping it out of the server's process list; the commands the
-server runs do not get it.
-
 and a `--remote [PASSWORD@]HOST[:PORT]` flag, which runs a command line
 on such a server, anywhere on the command line before a `--`:
 
@@ -201,10 +222,14 @@ on such a server, anywhere on the command line before a `--`:
     tool get battery --remote secret@boat
 
 The variable `TOOL_REMOTE`, named after the program, gives a default for
-the flag, and `--remote=` runs a command locally all the same.
+the flag, and `--remote=` runs a command locally all the same. On the
+server, the variable `TOOL_SERVER_PASSWORD` gives the password where
+`--password` does not, keeping it out of the server's process list; the
+commands the server runs do not get it.
 
 The help lists `--remote` among the flags of the program, its groups and
-its commands, except for `help`, `server` and what only runs locally.
+its commands, except for `help`, `server` and what does not run
+remotely.
 
 Each command runs in a new process of the program on the server, as if
 typed there, and its output, input and exit code are relayed. Where the
@@ -223,16 +248,32 @@ for the command's terminal on the server. To leave a command that does
 not end, type Enter, `~` and `.`, as in ssh: the client disconnects
 with exit code 255, and the server ends the command.
 
-Commands that must only run locally are named in a `fireaid.Remote`:
+With `remote=True`, every command runs remotely. A program that
+controls something physical does better to name the commands that do,
+in a `fireaid.Remote`, so that a command it gains later stays local
+until it is allowed:
+
+    fire.Fire(MyTool, remote=fire.Remote(allow=("status", "on", "off")))
+
+A command line must then start with one of them, or ask for help for
+one; what a chain of commands reaches from there is that command's.
+The program's help and usage, and help for `help` and `server`, are
+always there. A flag with a value goes after the command, since before
+it the value cannot be told from a command.
+
+Commands that must only run locally are named in `deny`:
 
     fire.Fire(MyTool, remote=fire.Remote(deny=("firmware",)))
 
 The server refuses them wherever they appear on a command line, help
-for them included, since Fire chains commands. It also refuses
-anything after a `--`: Fire's own flags, its interactive Python shell
-among them, stay local, and `--help` works without the separator.
-`fireaid.Remote` also sets the default port, 4247, and the name of
-the variable.
+for them included, since Fire chains commands, and whether they are
+allowed or not: `allow=("db",), deny=("db drop",)` allows every `db`
+command but `db drop`. The server also refuses anything after a `--`:
+Fire's own flags, its interactive Python shell among them, stay local,
+and `--help` works without the separator.
+`fireaid.Remote` also sets the default port, 4247, and with `env` the
+name of the variable in place of `TOOL_REMOTE`. `TOOL_SERVER_PASSWORD`
+is always named after the program.
 
 The server logs through the `fireaid.remote` logger: `Remote(setup=f)`
 names a function the server calls with its `--debug` flag before it
@@ -256,8 +297,9 @@ against a recorded login.
 
 The server runs one command at a time. A client that logs in meanwhile
 waits a few seconds for it to end, then is told the server is busy;
-clients slow to log in keep no other out. Server and client notice within a minute or so when the other has
-vanished without a word, as a computer gone to sleep does.
+clients slow to log in keep no other out. Server and client notice
+within a minute or so when the other has vanished without a word, as a
+computer gone to sleep does.
 
 A server on Windows, which has no pseudo-terminals, gives every command
 pipes: the command behaves as if its output were redirected, and Ctrl-C
@@ -266,7 +308,9 @@ a server on Linux or macOS; the two kinds work together either way.
 
 ## Limits
 
-fireaid does not take anything away from the wrapped program:
+fireaid does not take anything away from the wrapped program. The one
+thing it does differently from Fire on purpose is the values hinted
+parameters get, as [Type hints](#type-hints) describes. Otherwise:
 
 - `help` is only help as the first word, and not if the program has
   a `help` command of its own, or is a single function.
@@ -310,6 +354,7 @@ Set the new `version` in `pyproject.toml`, commit, then tag and push:
 
     git tag v0.2.0 && git push origin main v0.2.0
 
-The tag starts `.github/workflows/publish.yml`, which runs the tests,
-checks that the tag is the package version, builds, and publishes to
-PyPI as a trusted publisher. PyPI never takes the same version twice.
+The tag starts `.github/workflows/publish.yml`, which runs the tests
+as every push does, on Linux, macOS and Windows and against the oldest
+Fire, checks that the tag is the package version, builds, and publishes
+to PyPI as a trusted publisher. PyPI never takes the same version twice.
