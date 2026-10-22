@@ -18,6 +18,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import hmac
+import ipaddress
 import itertools
 import json
 import logging
@@ -144,6 +145,11 @@ def password_variable(prog: str) -> str:
     return _stem(prog) + "_SERVER_PASSWORD"
 
 
+def _endpoint(host: str, port: int) -> str:
+    """HOST:PORT, an IPv6 address in brackets."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 @dataclass(frozen=True)
 class Target:
     host: str
@@ -151,8 +157,7 @@ class Target:
     password: str | None
 
     def __str__(self) -> str:
-        host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"{host}:{self.port}"
+        return _endpoint(self.host, self.port)
 
 
 def parse_target(text: str, default_port: int) -> Target:
@@ -521,6 +526,28 @@ class _PlainFormatter(logging.Formatter):
         return f"{self.prog}: {level}{super().format(record)}"
 
 
+def _listening_address(bind: str, port: int) -> tuple[int, Any]:
+    """
+    The address family and address to listen on for --bind, which may be
+    an IPv4 or IPv6 address or a name. A name is taken as IPv4 where it
+    has both, as localhost does, since a client tries every address.
+    """
+    try:
+        found = socket.getaddrinfo(bind, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as e:
+        raise RemoteError(f"cannot listen on {_endpoint(bind, port)}: {e.strerror or e}") from None
+    found.sort(key=lambda entry: entry[0] != socket.AF_INET)
+    family, _, _, _, address = found[0]
+    return family, address
+
+
+def _is_loopback(address: Any) -> bool:
+    try:
+        return ipaddress.ip_address(address[0]).is_loopback
+    except ValueError:
+        return False
+
+
 def _plain_logging(prog: str, debug: bool) -> None:
     """Have the server's logger print plain lines to stderr, unless the program has set up logging."""
     if logging.getLogger().handlers or logger.handlers:
@@ -557,7 +584,8 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
 
     if not isinstance(bind, str) or not bind:
         raise RemoteError(f"{bind!r} is not an address to bind to", 2)
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    family, address = _listening_address(bind, port)
+    listener = socket.socket(family, socket.SOCK_STREAM)
     if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
         # Windows: there SO_REUSEADDR would let another program bind the port
         # while the server listens on it, and take its clients.
@@ -565,11 +593,12 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
     else:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # restart at once on the same port
     try:
-        listener.bind((bind, port))
+        listener.bind(address)
         listener.listen(5)
     except OSError as e:
         listener.close()
-        raise RemoteError(f"cannot listen on {bind}:{port}: {e.strerror or e}") from None
+        raise RemoteError(f"cannot listen on {_endpoint(*address[:2])}: {e.strerror or e}") from None
+    address = listener.getsockname()  # with the port given for 0
 
     def stop(_sig, _frame):
         raise SystemExit(0)
@@ -577,11 +606,11 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
     handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
     notes = "" if password is not None else ", no password"
     notes += "" if _pty_available() else ", commands get pipes"
-    logger.info(f"serving on {bind}:{listener.getsockname()[1]}{notes}")
+    logger.info(f"serving on {_endpoint(*address[:2])}{notes}")
     if password is None:
         logger.warning(f"anyone who can reach the port may run commands; --password or {secret} adds HMAC "
                        "challenge-response authentication (mild security)")
-    if not bind.startswith("127."):
+    if not _is_loopback(address):
         logger.warning("the command server is unencrypted, do not use over untrusted networks; "
                        "--bind 127.0.0.1 restricts access to localhost")
     logger.debug(f"starting {' '.join(launch.prefix)} in {launch.cwd} for each command")

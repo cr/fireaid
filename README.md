@@ -287,8 +287,9 @@ server prints plain lines. Each command is logged by its words up to the
 first flag, since a flag's value may be a password; `--debug` logs each
 client and its whole command line.
 
-The server listens on all of the computer's addresses unless `--bind`
-names one. Without a password, anyone who can reach the port may run the
+The server listens on all of the computer's IPv4 addresses unless
+`--bind` names one, an IPv6 address or a name included: `--bind ::1`
+is the IPv6 loopback, `--bind ::` all of its IPv6 addresses. Without a password, anyone who can reach the port may run the
 program's commands, which is the normal state of affairs on a network of
 one's own; the server says so once when it starts. With a password,
 client and server prove to each other that they know it, by HMAC

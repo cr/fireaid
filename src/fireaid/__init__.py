@@ -395,8 +395,9 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
         Args:
             port: The TCP port to listen on, 0 for any free one.
             password: The password clients must give; none by default, or {secret}.
-            bind: The address to listen on: all of this computer's by default,
-                127.0.0.1 for clients on this computer only.
+            bind: The address to listen on, IPv4 or IPv6, or a name: all of
+                this computer's IPv4 addresses by default, 127.0.0.1 for
+                clients on this computer only.
             debug: Log each client, its command line and how it ended.
         """
     # Types for the help, as objects: this module's annotations are strings.

@@ -72,7 +72,7 @@ class Log:
     rewording changes one place. Tests ask whether something happened.
     """
 
-    SERVING = re.compile(r"serving on (?P<host>\S+?):(?P<port>\d+)(?P<notes>[^\n]*)")
+    SERVING = re.compile(r"serving on (?P<host>\[[^\]]*\]|[^:\s]+):(?P<port>\d+)(?P<notes>[^\n]*)")
 
     def __init__(self, path):
         self.path = path
@@ -756,6 +756,50 @@ def test_open_server_without_a_password_warns(tmp_path):
     assert log.setup_debug() is False
     assert log.host() == "0.0.0.0" and log.without_password()
     assert log.warned_no_password() and log.warned_open_network()
+
+
+def ipv6_loopback():
+    """Whether this computer has an IPv6 loopback to listen on."""
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("bind, shown", [("localhost", "127.0.0.1"), ("::1", "[::1]")])
+def test_server_binds_a_name_or_an_ipv6_address(tmp_path, bind, shown):
+    """--bind takes what getaddrinfo reads; loopback is known by the address bound, not its spelling."""
+    if bind == "::1" and not ipv6_loopback():
+        pytest.skip("no IPv6 loopback here")
+    path = tmp_path / "log"
+    log_file = path.open("w")
+    process = subprocess.Popen(
+        [sys.executable, "cli.py", "server", "--port", "0", "--bind", bind],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_file,
+        env=environment("Probe"), cwd=TESTS,
+    )
+    log = Log(path)
+    try:
+        log.wait(lambda _: log.serving() is not None)
+        assert process.poll() is None, log.text
+        assert log.host() == shown
+        assert not log.warned_open_network()
+        target = f"{shown}:{log.port()}"
+        assert run(["foo", "x", "--remote", target], "Probe")[:2] == (0, "foo name='x' count=1\n")
+    finally:
+        process.terminate()
+        process.wait(10)
+        log_file.close()
+
+
+def test_server_names_an_address_it_cannot_resolve():
+    code, out, err = run(["server", "--port", "0", "--bind", "no.such.host.invalid"])
+    assert (code, out) == (1, "")
+    assert err.splitlines()[-1].startswith("cli.py: cannot listen on no.such.host.invalid:0: ")
 
 
 def test_connection_closed_before_the_handshake_is_no_refusal(server):
