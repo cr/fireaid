@@ -2,7 +2,8 @@
 # Windows, each on the oldest Python fireaid supports and the latest
 # stable one, with the latest stable Fire; and on Linux with the oldest
 # Python and the oldest Fire. Terminal tests skip on Windows, which has
-# no pseudo-terminals.
+# no pseudo-terminals. The publish workflow runs the same before a
+# release.
 
 name: Test
 
@@ -11,10 +12,15 @@ on:
     branches: ["**"]
     tags-ignore: ["v*"]  # the publish workflow tests a release itself
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20  # the suite takes two; a hung test is cut short
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +40,7 @@ jobs:
 
   test-min:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
