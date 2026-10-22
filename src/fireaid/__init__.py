@@ -56,7 +56,6 @@ import shlex
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from importlib import metadata as _metadata
 from typing import Any
 
 import fire as _fire
@@ -730,7 +729,9 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
     the parameters' type hints say.
     """
     color = _use_color()
+    # What to put back afterwards: a command may itself call Fire, within this call.
     streams = sys.stdout, sys.stderr
+    previous = _fire.core.Display, _fire.core.helptext
     conventional = display is _display_stdout
     # What Fire marks as bold are headings, as underlined placeholders.
     marks = {"Bold": _heading, "Underline": _placeholder} if color and conventional else {}
@@ -748,8 +749,7 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
             result = _fire.Fire(*args, **kwargs)
     finally:
         sys.stdout, sys.stderr = streams
-        _fire.core.Display = _display
-        _fire.core.helptext = _helptext
+        _fire.core.Display, _fire.core.helptext = previous
         for name, original in originals.items():
             setattr(_formatting, name, original)
 
@@ -781,7 +781,20 @@ def __getattr__(name: str) -> Any:
         fireaid.decorators
         fireaid.inspectutils
         fireaid.trace
+
+    fireaid's own __version__ is looked up when first asked for:
+    importlib.metadata would take a noticeable part of every program's
+    start.
     """
+    if name == "__version__":
+        from importlib import metadata
+
+        try:
+            version = metadata.version("fireaid")
+        except metadata.PackageNotFoundError:
+            version = "unknown"
+        globals()["__version__"] = version
+        return version
     return getattr(_fire, name)
 
 
@@ -800,8 +813,3 @@ def __dir__() -> list[str]:
 for _name, _module in list(sys.modules.items()):
     if _name.startswith("fire.") and not _name.endswith("__main__"):
         sys.modules.setdefault(__name__ + _name[len("fire"):], _module)
-
-try:
-    __version__ = _metadata.version("fireaid")
-except _metadata.PackageNotFoundError:
-    __version__ = "unknown"

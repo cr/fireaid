@@ -49,8 +49,8 @@ HAS_PTY = termios is not None and hasattr(os, "openpty")
 
 logger = logging.getLogger("fireaid.remote")
 
-# 2: input as the server asks for it, and a server that proves it knows the password.
-PROTOCOL = 2
+# The version of the messages below: client and server speak the same one.
+PROTOCOL = 1
 FLAG = "--remote"
 
 # Set in the environment of every command the server runs.

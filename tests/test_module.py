@@ -65,6 +65,16 @@ def test_version_is_our_own():
     assert fireaid.__version__ == metadata.version("fireaid")
 
 
+def test_import_leaves_the_version_for_later():
+    """importlib.metadata takes a noticeable part of a program's start: it waits for __version__."""
+    import subprocess
+    import sys
+
+    code = "import sys, fireaid; print('importlib.metadata' in sys.modules, fireaid.__version__ != 'unknown')"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out == "False True\n"
+
+
 def test_requirement_is_the_fire_with_plain_help():
     required = [r for r in metadata.requires("fireaid") if "extra ==" not in r]
     # Fire before 0.7.0 does not import on Python 3.13 and later.
@@ -224,6 +234,31 @@ def test_component_that_cannot_take_a_help_command(capsys):
     with pytest.raises(fire.core.FireExit) as exit:
         fireaid.Fire([1, 2], command="help")
     assert exit.value.code == 0
+
+
+class Box:
+    """A box."""
+
+    def open(self):
+        return "opened"
+
+
+class Nesting:
+    def nested(self, x):
+        """Run a sub-tool, then return what has commands of its own."""
+        fireaid.Fire(Program, command=["foo"])
+        return Box()
+
+
+def test_fire_within_fire_leaves_the_outer_call_as_it_was(capsys):
+    """A command that runs a sub-tool through fireaid, and returns, still gets fireaid's help for its result."""
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Nesting, command="nested x --help", name="tool")
+    assert exit.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith("foo x\n")  # the sub-tool's result
+    assert "tool nested x - A box." in captured.out
 
 
 def test_remote_config():
