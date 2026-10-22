@@ -45,13 +45,22 @@ On a terminal, usage text and help are coloured.
 
 from __future__ import annotations
 
+import datetime
+import decimal
+import enum
+import fractions
+import functools
 import importlib
 import inspect
+import ipaddress
+import math
 import os
+import pathlib
 import re
 import shlex
 import sys
 import typing
+import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -615,25 +624,161 @@ _helptext = getattr(_fire.core, "helptext", None)
 _formatting = getattr(_fire.core, "formatting", None)
 _decorators = getattr(_fire.core, "decorators", None)
 
+_fire_error = getattr(_fire.core, "FireError", ValueError)
+
 _OPTIONAL = re.compile(r"(?:typing\.)?Optional\[(.*)\]")
+_WORDS = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
+_UNIT = re.compile(r"(\d+(?:\.\d+)?)(ms|d|h|m|s)")
+_UNITS = re.compile(r"(?:\d+(?:\.\d+)?(?:ms|d|h|m|s))+")
+_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "ms": 0.001}
+_CLOCK = re.compile(r"(?:(-?\d+) days?, )?(-?\d+):(\d+)(?::(\d+(?:\.\d+)?))?")
+
+# Types whose constructor reads the text, and what they read. Earlier
+# entries win: an interface is an address too.
+_CONSTRUCTED = (
+    (str, "a string"),
+    (float, "a number"),
+    (complex, "a complex number"),
+    (decimal.Decimal, "a decimal number"),
+    (fractions.Fraction, "a fraction"),
+    (pathlib.PurePath, "a path"),
+    (uuid.UUID, "a UUID"),
+    (ipaddress.IPv4Interface, "an IP interface"),
+    (ipaddress.IPv6Interface, "an IP interface"),
+    (ipaddress.IPv4Address, "an IP address"),
+    (ipaddress.IPv6Address, "an IP address"),
+    (ipaddress.IPv4Network, "an IP network"),
+    (ipaddress.IPv6Network, "an IP network"),
+)
+
+
+def _unwrap(hint: Any) -> tuple[Any, bool]:
+    """The type within Optional[T], T | None and a NewType, and whether None is allowed."""
+    optional = False
+    if isinstance(hint, str):
+        # A hint that could not be evaluated: only its words are known.
+        text = hint.strip()
+        match = _OPTIONAL.fullmatch(text)
+        if match:
+            text, optional = match.group(1), True
+        parts = [part.strip() for part in text.split("|")]
+        if "None" in parts:
+            optional = True
+            parts = [part for part in parts if part != "None"]
+        return (parts[0] if len(parts) == 1 else hint), optional
+    args = typing.get_args(hint)
+    if args:
+        rest = [arg for arg in args if arg is not type(None)]
+        if len(rest) == len(args) or len(rest) != 1:
+            return hint, False  # a union of types, or a generic: Fire's
+        hint, optional = rest[0], True
+    while hasattr(hint, "__supertype__"):
+        hint = hint.__supertype__
+    return hint, optional
 
 
 def _is_str_hint(hint: Any) -> bool:
     """Whether a type hint, as an object or as a string, means str or None."""
+    inner, _ = _unwrap(hint)
+    return inner is str or inner == "str"
+
+
+def _parse_bool(text: str) -> bool:
+    try:
+        return _WORDS[text.strip().lower()]
+    except KeyError:
+        raise ValueError(text) from None
+
+
+def _parse_enum(cls: Any, text: str) -> Any:
+    for name, member in cls.__members__.items():
+        if name.lower() == text.lower():
+            return member
+    for member in cls:
+        if str(member.value) == text:
+            return member
+    raise ValueError(text)
+
+
+def _parse_timedelta(cls: Any, text: str) -> Any:
+    text = text.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        pass
+    else:
+        if not math.isfinite(seconds):
+            raise ValueError(text)
+        return cls(seconds=seconds)
+    match = _CLOCK.fullmatch(text)
+    if match:
+        days, hours, minutes, seconds = match.groups()
+        clock = cls(hours=abs(int(hours)), minutes=int(minutes), seconds=float(seconds or 0))
+        if days is not None:
+            return cls(days=int(days)) + clock
+        return -clock if hours.startswith("-") else clock
+    body = text.lstrip("+-")
+    if not _UNITS.fullmatch(body):
+        raise ValueError(text)
+    total = sum(float(number) * _SECONDS[unit] for number, unit in _UNIT.findall(body))
+    return cls(seconds=-total if text.startswith("-") else total)
+
+
+def _parser_for(hint: Any) -> Any:
+    """
+    How to read the text for a type hint: a function, what it reads,
+    and whether the text None means None. None for a hint that is left
+    to Fire.
+    """
+    hint, optional = _unwrap(hint)
     if isinstance(hint, str):
-        text = hint.strip()
-        match = _OPTIONAL.fullmatch(text)
-        if match:
-            text = match.group(1)
-        return {part.strip() for part in text.split("|")} - {"None"} == {"str"}
-    if hint is str:
-        return True
-    args = [arg for arg in typing.get_args(hint) if arg is not type(None)]
-    return len(args) == 1 and args[0] is str
+        if hint != "str":
+            return None
+        hint = str
+    if typing.get_origin(hint) is not None or not inspect.isclass(hint):
+        return None  # a generic such as list[int] is a class on Python 3.9 and 3.10
+    if hint is bool:
+        parse, form = _parse_bool, "true or false"
+    elif issubclass(hint, enum.Enum):
+        parse = functools.partial(_parse_enum, hint)
+        form = "one of " + ", ".join(name.lower() for name in hint.__members__)
+    elif issubclass(hint, int):
+        # The subclass may take only a value, so int reads the text first.
+        parse, form = (lambda text, _cls=hint: _cls(int(text, 0))), "an integer"
+    elif issubclass(hint, datetime.timedelta):
+        parse, form = functools.partial(_parse_timedelta, hint), "a duration: seconds, 1h30m or H:MM:SS"
+    elif issubclass(hint, datetime.datetime):
+        parse, form = hint.fromisoformat, "a date and time in ISO 8601"
+    elif issubclass(hint, datetime.date):
+        parse, form = hint.fromisoformat, "a date, YYYY-MM-DD"
+    elif issubclass(hint, datetime.time):
+        parse, form = hint.fromisoformat, "a time, HH:MM[:SS]"
+    else:
+        for cls, form in _CONSTRUCTED:
+            if issubclass(hint, cls):
+                parse = hint
+                break
+        else:
+            return None
+    return parse, form, optional
 
 
-def _str_parameters(component: Any) -> list[str]:
-    """The parameters of what Fire is about to call that are hinted str."""
+def _parse_function(name: str, parse: Any, form: str, optional: bool) -> Any:
+    """A parse function for Fire, failing the way Fire reports."""
+
+    def parse_value(text: str) -> Any:
+        if optional and text == "None":
+            return None
+        try:
+            return parse(text)
+        except (ValueError, ArithmeticError, TypeError):
+            raise _fire_error(f"{name}: {text!r} is not {form}") from None
+
+    return parse_value
+
+
+def _parsers(component: Any) -> dict[str, Any]:
+    """Parse functions for the hinted parameters of what Fire is about to call."""
     fn = component
     if inspect.isclass(component):
         fn = component.__init__
@@ -641,20 +786,33 @@ def _str_parameters(component: Any) -> list[str]:
         fn = getattr(component, "__call__", None)
     try:
         annotations = dict(getattr(fn, "__annotations__", None) or {})
+        namespace = getattr(fn, "__globals__", None) or {}
     except Exception:  # noqa: BLE001 - a program may hide anything behind __getattr__
-        return []
-    return [name for name, hint in annotations.items() if name != "return" and _is_str_hint(hint)]
+        return {}
+    parsers = {}
+    for name, hint in annotations.items():
+        if name == "return":
+            continue
+        if isinstance(hint, str):
+            try:
+                hint = eval(hint, dict(namespace))  # noqa: S307 - as typing.get_type_hints reads it
+            except Exception:  # noqa: BLE001 - then only its words are known
+                pass
+        found = _parser_for(hint)
+        if found is not None:
+            parsers[name] = _parse_function(name, *found)
+    return parsers
 
 
 @contextmanager
 def _typed_parsing() -> Any:
     """
-    Have Fire keep the string of a value for a parameter hinted str.
+    Have Fire read values as the parameters' type hints say.
 
     Fire reads a function's parse functions from its metadata when it
-    calls it. For the duration of the call, the metadata gains str as
-    the parse function of each parameter hinted str, where the program
-    has not set parse functions of its own with fire.decorators.
+    calls it. For the duration of the call, the metadata gains a parse
+    function for each parameter whose hint fireaid reads, where the
+    program has not set parse functions of its own with fire.decorators.
     """
     original = getattr(_decorators, "GetMetadata", None)
     key = getattr(_decorators, "FIRE_PARSE_FNS", None)
@@ -665,7 +823,7 @@ def _typed_parsing() -> Any:
     def GetMetadata(component: Any) -> Any:  # noqa: N802 - Fire's name
         metadata = original(component)
         parse_fns = metadata.get(key) or {"default": None, "positional": [], "named": {}}
-        named = {name: str for name in _str_parameters(component)}
+        named = _parsers(component)
         if not named or parse_fns.get("default") is not None:
             return metadata
         named.update(parse_fns["named"])

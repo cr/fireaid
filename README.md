@@ -64,18 +64,37 @@ continues to work, as do `import fireaid.core` and `python -m fireaid`.
 
 Fire parses every value on the command line as a Python literal where
 it can, whatever the parameter's type hint: `--name 42` gives an `int`,
-`--name 1e3` a `float`, `--name [1,2]` a list. fireaid keeps the string
-as typed for a parameter hinted `str`, `Optional[str]` or `str | None`,
-in a function, a method or a class constructor:
+`--name 1e3` a `float`, `--name [1,2]` a list. fireaid reads the hint
+instead, in a function, a method or a class constructor, and gives the
+parameter what the hint says or a usage error:
 
-    def set(self, name: str, value: str):
+    def set(self, name: str, count: int, since: datetime.date):
         ...
 
-    tool set 007 1e3        # name='007', value='1e3'
+    tool set 007 0x10 2026-10-15    # name='007', count=16, since=date(2026, 10, 15)
+    tool set 007 1e3 2026-10-15     # ERROR: count: '1e3' is not an integer
 
-Other hints are left to Fire, and so is a parameter whose parse
-function the program sets with `fire.decorators.SetParseFn` or
-`SetParseFns`.
+The hints fireaid reads:
+
+- `str`: the string as typed, quotes and all.
+- `int`: with `0x`, `0o` and `0b` prefixes and `_` separators, as
+  `int(text, 0)` reads it; `float`, `complex`, `Decimal`, `Fraction`.
+- `bool`: true, false, yes, no, on, off, 1 or 0, in any case. A bare
+  `--flag` is true and `--noflag` false, as in Fire.
+- `Path`, `UUID`, and the `ipaddress` addresses, networks and
+  interfaces.
+- `date`, `datetime` and `time`, in ISO 8601 as the Python version's
+  `fromisoformat` reads it: `2026-10-15`, `2026-10-15T12:30`, `12:30`.
+- `timedelta`: a number of seconds, units as in `1h30m`, `2d`, `1.5h`
+  or `250ms`, or the clock form `1:30:00` that `str()` prints.
+- An `Enum`: a member by name, in any case, or by value.
+- `Optional[T]` and `T | None`: the text `None` is `None`, anything
+  else is read as `T`. A `NewType` and a subclass of any of the above
+  are read as the type they are made of.
+
+Other hints, and parameters without one, are left to Fire, and so is
+a parameter whose parse function the program sets with
+`fire.decorators.SetParseFn` or `SetParseFns`.
 
 ## Help
 

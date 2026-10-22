@@ -11,10 +11,17 @@ static only runs locally.
 
 from __future__ import annotations  # annotations are strings, as in most programs
 
+import datetime
+import decimal
+import enum
+import fractions
+import ipaddress
 import os
+import pathlib
 import sys
 import time
-from typing import Optional
+import uuid
+from typing import NewType, Optional
 
 fire = __import__(os.environ.get("FIREAID_TEST_MODULE", "fireaid"))
 
@@ -174,6 +181,48 @@ class Typed:
     def default(self, word: str, *rest):
         """Default doc: the program's default parse function wins."""
         return f"default word={word!r} rest={rest!r}"
+
+
+class Color(enum.Enum):
+    RED = "red"
+    GREEN = "green"
+
+
+class Level(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+Port = NewType("Port", int)
+
+
+class Kinds:
+    """Commands with hints of many kinds."""
+
+    def __init__(self, level: Level = Level.LOW):
+        self.level = level
+
+    def num(self, count: int = 0, ratio: float = 0.0, z: complex = 0j):
+        """Num doc."""
+        return f"num level={self.level!r} count={count!r} ratio={ratio!r} z={z!r}"
+
+    def exact(self, money: decimal.Decimal = decimal.Decimal(0), part: fractions.Fraction = fractions.Fraction(0)):
+        """Exact doc."""
+        return f"exact money={money!r} part={part!r}"
+
+    def ident(self, path: pathlib.Path = pathlib.Path("."), uid: Optional[uuid.UUID] = None,
+              host: Optional[ipaddress.IPv4Address] = None, port: Port = Port(0)):
+        """Ident doc."""
+        return f"ident path={path!r} uid={uid!r} host={host!r} port={port!r}"
+
+    def when(self, day: datetime.date = datetime.date(2000, 1, 1), at: Optional[datetime.datetime] = None,
+             tick: datetime.time = datetime.time(0), wait: datetime.timedelta = datetime.timedelta(0)):
+        """When doc."""
+        return f"when day={day!r} at={at!r} tick={tick!r} wait={wait!r}"
+
+    def choice(self, color: Color = Color.RED, flag: bool = False, bare=None):
+        """Choice doc."""
+        return f"choice color={color!r} flag={flag!r} bare={bare!r}"
 
 
 def typed(word: str, count: int = 1):
