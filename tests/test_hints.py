@@ -376,9 +376,9 @@ def test_subclass_of_datetime():
         ("--level high num", "num level=<Level.HIGH: 2> count=0 ratio=0.0 z=0j\n"),
         ("exact --money 1.10 --part 1/3", "exact money=Decimal('1.10') part=Fraction(1, 3)\n"),
         ("ident --path 123 --uid 12345678123456781234567812345678 --host 10.0.0.1 --port 80",
-         "ident path=PosixPath('123') uid=UUID('12345678-1234-5678-1234-567812345678') "
+         f"ident path={pathlib.Path('123')!r} uid=UUID('12345678-1234-5678-1234-567812345678') "
          "host=IPv4Address('10.0.0.1') port=80\n"),
-        ("ident --uid None", "ident path=PosixPath('.') uid=None host=None port=0\n"),
+        ("ident --uid None", f"ident path={pathlib.Path('.')!r} uid=None host=None port=0\n"),
         ("when --day 2026-10-15 --at 2026-10-15T12:30 --tick 12:30 --wait 1h30m",
          "when day=datetime.date(2026, 10, 15) at=datetime.datetime(2026, 10, 15, 12, 30) "
          "tick=datetime.time(12, 30) wait=datetime.timedelta(seconds=5400)\n"),

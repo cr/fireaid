@@ -456,6 +456,21 @@ def _color_usage(text: str) -> str:
     return "\n".join(lines)
 
 
+def _unstripped(stream: Any) -> Any:
+    """
+    The stream colorama wraps, where it would only strip colour from it.
+
+    On Windows, Fire has colorama wrap stdout and stderr, which strips
+    colour from what is not a terminal, FORCE_COLOR or not. On a legacy
+    console it turns colour into console calls instead: there the
+    wrapper stays.
+    """
+    convertor = getattr(stream, "_StreamWrapper__convertor", None)  # colorama's StreamWrapper
+    if convertor is not None and getattr(convertor, "strip", False) and not getattr(convertor, "convert", True):
+        return getattr(convertor, "wrapped", stream)
+    return stream
+
+
 def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
     """
     Stand in for fire.core.Display, printing to stdout instead of stderr,
@@ -711,9 +726,11 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
 
     On a terminal, usage text is coloured, and so is help that was asked
     for in conventional syntax. Help in Fire's native syntax is Fire's.
-    Values are read as the parameters' type hints say.
+    Where colour is on, colorama does not strip it. Values are read as
+    the parameters' type hints say.
     """
     color = _use_color()
+    streams = sys.stdout, sys.stderr
     conventional = display is _display_stdout
     # What Fire marks as bold are headings, as underlined placeholders.
     marks = {"Bold": _heading, "Underline": _placeholder} if color and conventional else {}
@@ -724,10 +741,13 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any)
     _fire.core.Display = display
     for name, stand_in in marks.items():
         setattr(_formatting, name, stand_in)
+    if color:
+        sys.stdout, sys.stderr = map(_unstripped, streams)
     try:
         with _hints.typed_parsing():
             result = _fire.Fire(*args, **kwargs)
     finally:
+        sys.stdout, sys.stderr = streams
         _fire.core.Display = _display
         _fire.core.helptext = _helptext
         for name, original in originals.items():

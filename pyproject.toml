@@ -21,8 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    "colorama",  # what Fire strips colour with on Windows, to test against anywhere
     "pytest",
-    "rich"  # for examples/progress.py
+    "rich",  # for examples/progress.py
 ]
 
 [project.urls]
