@@ -106,6 +106,10 @@ class Device:
         """Run a sub-tool of its own through Fire, as some commands do."""
         return fire.Fire(Sub, command=["bar"], name="sub")
 
+    def table(self):
+        """Return a dict, which Fire chains into by key rather than by member."""
+        return {"firmware": self.firmware, "ok": True}
+
 
 class WithHelp(CLI):
     def help(self, topic="general"):

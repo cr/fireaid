@@ -97,7 +97,8 @@ The hints fireaid reads:
   are read as the type they are made of.
 
 The hint of `*args` is read for each of its values, and the hint of
-`**kwargs` for each flag it takes, unless the two differ.
+`**kwargs` for each flag it takes. A function that has both gets that
+only if their hints are the same: Fire reads the two alike.
 
 Other hints, and parameters without one, are left to Fire, and so is
 a parameter whose parse function the program sets with

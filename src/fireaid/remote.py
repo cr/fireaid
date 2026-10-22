@@ -261,11 +261,11 @@ def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | Non
     a flag goes after it.
     """
     argv = list(argv)
+    words = argv
     if "--" in argv:
-        last = len(argv) - 1 - argv[::-1].index("--")
-        if argv[last + 1 :]:
+        if argv[len(argv) - argv[::-1].index("--") :]:
             return "flags after -- are not available remotely; --help works without the separator"
-    words = argv[: argv.index("--")] if "--" in argv else argv
+        words = argv[: argv.index("--")]
     if any(w == FLAG or w.startswith(FLAG + "=") for w in words):
         return f"{FLAG} cannot be passed on to the server"
 
@@ -1019,12 +1019,7 @@ class _PtyCommand(_Command):
         channel = self.channel
         selector = selectors.SelectSelector()
         try:
-            while self.outputs or self.process.poll() is None:
-                if self.process.poll() is not None:
-                    # Done: what it wrote is in its outputs now. Something it
-                    # left running may hold them open, and is not waited for.
-                    self.drain(selector)
-                    break
+            while self.process.poll() is None:
                 _watch(selector, channel.sock,
                        selectors.EVENT_READ | (selectors.EVENT_WRITE if channel.outgoing else 0))
                 for fd in {*self.outputs, self.stdin} - {None}:
@@ -1049,6 +1044,9 @@ class _PtyCommand(_Command):
                     self.on_message(kind, payload)
                 self.close_input_if_done(selector)
                 self.ask_for_more_input()
+            # Done: what it wrote is in its outputs now. Something it left
+            # running may hold them open, and is not waited for.
+            self.drain(selector)
         finally:
             selector.close()
 

@@ -337,6 +337,19 @@ def test_variadic_parameters_with_different_hints_are_fires():
     assert fireaid.Fire(both, command=["1e3", "--a", "5"]) == ((1000.0,), {"a": 5})
 
 
+def test_variadic_parameter_without_a_hint_beside_one_with():
+    """Fire reads both with one function: a hint on one of them cannot be kept from the other, so both are Fire's."""
+
+    def words(*words: str, **flags):
+        return words, flags
+
+    def flags(*words, **flags: str):
+        return words, flags
+
+    for fn in (words, flags):
+        assert fireaid.Fire(fn, command=["1e3", "--a", "5"]) == ((1000.0,), {"a": 5})
+
+
 def test_bare_parameters_are_fires():
     def fn(value=None, *rest):
         return value, rest

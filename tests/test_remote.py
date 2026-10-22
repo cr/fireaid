@@ -578,6 +578,18 @@ def test_chained_command_outside_allow_does_not_run(tmp_path):
         s.stop()
 
 
+def test_chain_through_a_dict_is_held_too(tmp_path):
+    """Fire takes a dict's key without looking a member up; the allow list holds there all the same."""
+    s = Server("Device", False, tmp_path / "log", FIREAID_TEST_ALLOW="table")
+    try:
+        assert run(["table", "--remote", s.target], "Device")[0] == 0
+        code, out, err = run(["table", "firmware", "--remote", s.target], "Device")
+        # Old Fire reads every member on the way, the gadget property included: its line may come first.
+        assert (code, out) == (2, "") and err.endswith("cli.py: 'firmware' is not available remotely\n")
+    finally:
+        s.stop()
+
+
 # -- what a client sends cannot forge or disturb the server's log
 
 
@@ -1238,6 +1250,33 @@ def test_run_time_check_holds_by_itself(monkeypatch, capsys):
     # Outside a server's command, the same program runs anything.
     monkeypatch.delenv(remote.CHILD_VARIABLE)
     assert fireaid.Fire(Device, command=["firmware"], name="tool", remote=allow) == "flashed"
+
+
+def test_run_time_check_holds_for_a_dict_program(monkeypatch, capsys):
+    """A program that is a dict, and a result that is one: Fire takes their keys without a member lookup."""
+    monkeypatch.setenv(remote.CHILD_VARIABLE, "1")
+    monkeypatch.delenv("TOOL_REMOTE", raising=False)
+    ran = []
+
+    def firmware():
+        ran.append("firmware")
+        return "flashed"
+
+    def status():
+        return {"firmware": firmware, "ok": True}
+
+    def listing():
+        return [firmware]
+
+    program = {"status": status, "listing": listing, "firmware": firmware}
+    allow = fireaid.Remote(allow=("status", "listing"))
+    for command, refused in ((["firmware"], "firmware"), (["status", "firmware"], "firmware"),
+                             (["listing", "0"], "0")):
+        with pytest.raises(SystemExit) as exit:
+            fireaid.Fire(program, command=command, name="tool", remote=allow)
+        assert exit.value.code == 2 and ran == []
+        assert capsys.readouterr().err == f"tool: '{refused}' is not available remotely\n"
+    assert fireaid.Fire(program, command=["status"], name="tool", remote=allow)["ok"] is True
 
 
 def test_any_mac_is_refused_as_such(server):

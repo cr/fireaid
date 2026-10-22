@@ -28,7 +28,7 @@ from fire import core, decorators, parser
 _OPTIONAL = re.compile(r"(?:typing\.)?Optional\[(.*)\]")
 _WORDS = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
 _UNIT = re.compile(r"(\d+(?:\.\d+)?)(ms|d|h|m|s)")
-_UNITS = re.compile(r"(?:\d+(?:\.\d+)?(?:ms|d|h|m|s))+")
+_UNITS = re.compile(f"(?:{_UNIT.pattern})+")
 _SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "ms": 0.001}
 _CLOCK = re.compile(r"(?:(-?\d+) days?, )?(-?\d+):(\d+)(?::(\d+(?:\.\d+)?))?")
 
@@ -137,7 +137,7 @@ def _parser_for(hint: Any) -> Any:
         form = "one of " + ", ".join(name.lower() for name in hint.__members__)
     elif issubclass(hint, int):
         # The subclass may take only a value, so int reads the text first.
-        parse, form = (lambda text, _cls=hint: _cls(int(text, 0))), "an integer"
+        parse, form = (lambda text: hint(int(text, 0))), "an integer"
     elif issubclass(hint, datetime.timedelta):
         parse, form = functools.partial(_parse_timedelta, hint), "a duration: seconds, 1h30m or H:MM:SS"
     elif issubclass(hint, datetime.datetime):
@@ -179,8 +179,10 @@ def _parsers(component: Any) -> tuple[dict[str, Any], Any]:
     Fire reads those with its default parse function, which is also
     what any other parameter without a parse function of its own falls
     back to. Where there is one for them, every other parameter gets
-    one, Fire's own where fireaid does not read its hint. Where
-    ``*args`` and ``**kwargs`` have different hints, both are Fire's.
+    one, Fire's own where fireaid does not read its hint. Where a
+    function has both ``*args`` and ``**kwargs``, they are read only if
+    their hints are the same: with different ones, or one of them
+    without, both are Fire's.
     """
     fn = component
     if inspect.isclass(component):
@@ -195,25 +197,21 @@ def _parsers(component: Any) -> tuple[dict[str, Any], Any]:
         return {}, None
     variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     named = {}
-    rest = []  # (hint, parse function) of *args and **kwargs
+    rest = []  # (hint, parse function or None) of *args and **kwargs, hinted or not
     for parameter in parameters:
-        if parameter.name not in annotations:
-            continue
-        hint = annotations[parameter.name]
+        hint = annotations.get(parameter.name, parameter.empty)
         if isinstance(hint, str):
             try:
                 hint = eval(hint, namespace)  # as typing.get_type_hints reads it
             except Exception:  # then only its words are known
                 pass
-        found = _parser_for(hint)
-        if found is None:
-            continue
-        parse = _parse_function(parameter.name, *found)
+        found = None if hint is parameter.empty else _parser_for(hint)
+        parse = None if found is None else _parse_function(parameter.name, *found)
         if parameter.kind in variadic:
             rest.append((hint, parse))
-        else:
+        elif parse is not None:
             named[parameter.name] = parse
-    if not rest or any(hint != rest[0][0] for hint, _ in rest):
+    if not rest or rest[0][1] is None or any(hint != rest[0][0] for hint, _ in rest):
         return named, None
     for parameter in parameters:
         if parameter.kind not in variadic:

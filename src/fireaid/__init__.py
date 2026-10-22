@@ -389,8 +389,8 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
         terminal where the client has one: colour, progress bars, the
         terminal width, prompts and Ctrl-C work as they do locally.
         One command runs at a time; a client that comes meanwhile waits a
-        few seconds, then is told the server is busy. Where Ctrl-C is a key for the server's terminal,
-        Enter ~ . disconnects.{local}
+        few seconds, then is told the server is busy. Where Ctrl-C is a
+        key for the server's terminal, Enter ~ . disconnects.{local}
 
         Args:
             port: The TCP port to listen on, 0 for any free one.
@@ -583,7 +583,7 @@ class _HelpText:
         self.color_usage = color_usage
         self.color_help = color_help
         self.conventional = conventional  # help was asked for in fireaid's syntax
-        self.remote = remote  # (prog, variable, deny, allow) of a remote-controlled program
+        self.remote = remote  # (Remote, prog, variable) of a remote-controlled program
 
     def __getattr__(self, name: str) -> Any:
         return getattr(_helptext, name)
@@ -613,8 +613,7 @@ def _section(sections: Sequence[str], heading: str) -> Any:
     return next((i for i, s in enumerate(sections) if s.startswith(heading + "\n")), None)
 
 
-def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Sequence[str], allow: Any,
-                      color: bool) -> str:
+def _with_remote_flag(text: str, trace: Any, remote: Remote, prog: str, variable: str, color: bool) -> str:
     """
     Add --remote to the flags in the help for what can run remotely: the
     program, its groups and commands, other than help, the server and
@@ -625,7 +624,7 @@ def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Seq
     except AttributeError:
         return text
     words = shlex.split(command)[1:]
-    if words[:1] == ["help"] or _remote_module().refusal(words, deny, allow) is not None:
+    if words[:1] == ["help"] or _remote_module().refusal(words, remote.deny, remote.allow) is not None:
         return text
     placeholder = "[PASSWORD@]HOST[:PORT]"
     entry = (f"    --remote={_placeholder(placeholder) if color else placeholder}\n"
@@ -763,7 +762,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         launch = module.Launch.capture()
         component, undo_server = _add_member(component, "server", _server_command(remote, prog, variable, launch))
         arguments["component"] = component
-        remote_help = (prog, variable, remote.deny, remote.allow)
+        remote_help = (remote, prog, variable)
         if remote.allow is not None and os.environ.get(module.CHILD_VARIABLE):
             # In the command's own process on the server: hold the command to
             # what is allowed as it actually runs, chained calls included,
@@ -797,12 +796,13 @@ def _allowed_calls(allow: Sequence[str], prog: str) -> Any:
 
     The server's refusal reads the command line as text and so sees only
     where it starts. Here, in the command's own process, each command
-    word is checked before Fire looks it up, so that not even a
-    property's code runs for a word refused: navigating towards or
-    within an allowed path is let through, a class on the way included,
-    which Fire instantiates; but once a routine has been called, a
-    further command word is a chain onto its result, and refused. help
-    and server are fireaid's own and left alone.
+    word is checked as Fire takes it, a member before it is looked up, so
+    that not even a property's code runs for a word refused, and a dict's
+    key or a list's index as it is noted in the trace: navigating towards
+    or within an allowed path is let through, a class on the way
+    included, which Fire instantiates; but once a routine has been
+    called, a further command word is a chain onto its result, and
+    refused. help and server are fireaid's own and left alone.
 
     Only the command's own run is held so: what the command does with
     Fire itself, in a nested call, is its own business. A refusal ends
@@ -812,44 +812,61 @@ def _allowed_calls(allow: Sequence[str], prog: str) -> Any:
     """
     allowed = [tuple(w.replace("-", "_") for w in entry.split()) for entry in allow]
     run, get_member, call = _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace
+    accessed = _fire.trace.FireTrace.AddAccessedProperty
     path: list[str] = []
-    called = [False]
-    depth = [0]  # Fire runs under way: 1 is the command's own
+    called = False
+    depth = 0  # Fire runs under way: 1 is the command's own
 
     def refuse(words: str) -> None:
         print(f"{prog}: {_remote_module().not_available(words)}", file=sys.stderr)
         raise _fire.core.FireExit(2, None)
 
+    def check(word: str) -> str:
+        """Refuse the next command word unless it stays within an allowed path. Returns it folded."""
+        if called:
+            refuse(word)  # a command word after a command ran: a chain onto its result
+        here = (*path, word.replace("-", "_"))
+        if here[0] not in ("help", "server") and not any(here[: len(a)] == a[: len(here)] for a in allowed if a):
+            refuse(" ".join(here))
+        return here[-1]
+
     def _Fire(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
-        depth[0] += 1
+        nonlocal depth
+        depth += 1
         try:
             return run(*args, **kwargs)
         finally:
-            depth[0] -= 1
+            depth -= 1
 
     def _GetMember(component: Any, args: Any) -> Any:  # noqa: N802 - Fire's name
-        if depth[0] == 1:
-            word = args[0].replace("-", "_")
-            if called[0]:
-                refuse(args[0])  # a command word after a command ran: a chain onto its result
-            here = (*path, word)
-            if here[0] not in ("help", "server") and not any(here[: len(a)] == a[: len(here)] for a in allowed if a):
-                refuse(" ".join(here))
-            path.append(word)
+        # Before Fire looks a member up, so that not even a property's code runs for a word refused.
+        if depth == 1:
+            check(args[0])
         return get_member(component, args)
+
+    def AddAccessedProperty(trace: Any, component: Any, target: Any, args: Any, *rest: Any) -> Any:  # noqa: N802
+        # After any command word was taken: a member, or a dict's key or a
+        # list's index, which Fire takes without _GetMember. It is part of
+        # the path from here on.
+        if depth == 1:
+            path.append(check(args[0]))
+        return accessed(trace, component, target, args, *rest)
 
     def _CallAndUpdateTrace(component: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
         # Calling a routine once a command word was taken runs the command.
         # Instantiating a class does not: it is the program, or a group on the way.
-        if depth[0] == 1 and path and not inspect.isclass(component):
-            called[0] = True
+        nonlocal called
+        if depth == 1 and path and not inspect.isclass(component):
+            called = True
         return call(component, *args, **kwargs)
 
     _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace = _Fire, _GetMember, _CallAndUpdateTrace
+    _fire.trace.FireTrace.AddAccessedProperty = AddAccessedProperty
     try:
         yield
     finally:
         _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace = run, get_member, call
+        _fire.trace.FireTrace.AddAccessedProperty = accessed
 
 
 def _fire_with(display: Any, *args: Any, remote_help: Any = None, enforce_allow: Any = None, **kwargs: Any) -> Any:
