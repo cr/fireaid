@@ -42,7 +42,8 @@ For development:
 
 fireaid requires Fire 0.2.0 or later, the first version to accept
 `--help` without a separator, and Fire 0.4.0 for `python -m fireaid`.
-On Python 3.13 and later, Fire itself requires version 0.7.0.
+On Python 3.13 and later, it requires Fire 0.7.0, the first that runs
+there.
 
 ## Usage
 
@@ -213,7 +214,9 @@ locally; where the client has a pipe or a file, the command gets a pipe.
 The client's `TERM`, `NO_COLOR`, `FORCE_COLOR`, `COLUMNS` and locale
 settings go along, not its `PAGER`, which Fire runs in a shell.
 Input goes to the server as the command reads it, so that a command
-that reads slowly, or not at all, keeps it waiting at the client.
+that reads slowly, or not at all, keeps it waiting at the client. A
+command is done when it exits, even if something it started, such as a
+daemon, still holds its output.
 
 Where the client's terminal passes keys straight on, Ctrl-C is a key
 for the command's terminal on the server. To leave a command that does
@@ -252,8 +255,8 @@ output, take over a session once it has started, and try passwords
 against a recorded login.
 
 The server runs one command at a time. A client that logs in meanwhile
-is told the server is busy, and clients slow to log in keep no other
-out. Server and client notice within a minute or so when the other has
+waits a few seconds for it to end, then is told the server is busy;
+clients slow to log in keep no other out. Server and client notice within a minute or so when the other has
 vanished without a word, as a computer gone to sleep does.
 
 A server on Windows, which has no pseudo-terminals, gives every command

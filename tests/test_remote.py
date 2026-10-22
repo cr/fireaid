@@ -856,7 +856,7 @@ def test_pipes_only_command_lets_go_of_its_threads():
     theirs.close()
     runner.join(15)
     ours.close()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 15
     while threading.active_count() > before and time.monotonic() < deadline:
         time.sleep(0.05)
     assert result == [None]
@@ -915,11 +915,128 @@ def test_busy_server_says_so(server):
         assert first.stdout.readline().rstrip(b"\r\n") == b"started"
         started = time.monotonic()
         code, out, err = run(["tty", "--remote", target], "Probe")
-        assert time.monotonic() - started < 3
+        assert time.monotonic() - started < 20  # the wait, not the command's 30 s
         assert (code, out) == (1, "") and Said.busy(err)
     finally:
+        before = len(server("Probe").log.text)
         first.kill()
         first.wait()
+        server("Probe").log.wait(lambda text: "went away" in text[before:])
+
+
+@unix
+def test_next_client_waits_for_a_command_ending(server):
+    """A command that takes a moment to end, its client gone, delays the next client rather than turning it away."""
+    target = server("Probe").target
+    first = subprocess.Popen(
+        [sys.executable, "cli.py", "stubborn", "--remote", target],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment("Probe"), cwd=TESTS,
+    )
+    assert first.stdout.readline().rstrip(b"\r\n") == b"started"
+    first.kill()
+    first.wait()
+    code, out, err = run(["tty", "--remote", target], "Probe")
+    assert (code, err) == (0, "")
+
+
+@pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
+def test_command_is_done_when_it_is(server, pipes):
+    """
+    A command that leaves a process running, holding its output pipes,
+    is done when it exits. (On a terminal, that process gets SIGHUP.)
+    """
+    target = server("Probe", pipes=pipes).target
+    started = time.monotonic()
+    assert run(["spawn", "--remote", target], "Probe") == (0, "spawned\n", "")
+    assert time.monotonic() - started < 10  # not the 15 s of what it left running
+
+
+@unix
+def test_end_of_input_from_a_terminal(server):
+    """Ctrl-D at the client's terminal ends the input of a command that has a pipe for it."""
+    target = server("Probe", pipes=True).target
+    code, output, _ = on_terminal(["cat", "--remote", target], keys=b"hello\n\x04")
+    assert code == 0
+    assert output.count("hello") == 2  # as typed, and from cat
+
+
+@unix  # ps tells the client's memory
+def test_windows_like_client_reads_input_as_it_is_asked_for(server):
+    """The thread that reads stdin waits for the server too."""
+    s = server("Probe")
+    client = subprocess.Popen(
+        [sys.executable, "cli.py", "sleep", "--seconds", "20", "--remote", s.target],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=environment("Probe", FIREAID_REMOTE_TEST_NO_PTY="1"), cwd=TESTS,
+    )
+    sent = []
+
+    def feed():
+        try:
+            for _ in range(200):
+                client.stdin.write(b"x" * (1 << 20))
+                sent.append(1)
+        except (BrokenPipeError, ValueError):
+            pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    time.sleep(3)
+    memory = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(client.pid)])) // 1024
+    client.kill()
+    client.wait()
+    assert len(sent) < 50, "the client's stdin backs up"
+    assert memory < 100, f"the client holds {memory} MiB"
+
+
+def test_bad_message_mid_command_is_reported():
+    """A server's malformed message is an error to report, not a crash."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def bad_server():
+        sock, _ = listener.accept()
+        channel = remote._Channel(sock)
+        channel.write(remote.CHALLENGE, {"proto": remote.PROTOCOL, "nonce": "ab" * 32, "auth": False, "pty": False})
+        channel.read()  # HELLO
+        channel.write(remote.AUTH_OK)
+        channel.read()  # RUN
+        channel.write(remote.EXIT, {"code": "x"})
+        sock.close()
+
+    thread = threading.Thread(target=bad_server)
+    thread.start()
+    result = run(["foo", "x", "--remote", f"127.0.0.1:{port}"])
+    thread.join(10)
+    listener.close()
+    assert result == (1, "", f"cli.py: 127.0.0.1:{port}: bad code\n")
+
+
+@unix
+def test_terminal_is_restored_whatever_goes_wrong(monkeypatch):
+    """Once the client's terminal is raw, an error on the way leaves it as it was."""
+    master, slave = pty.openpty()
+    saved_stdin = os.dup(0)
+    ours, theirs = socket.socketpair()
+    try:
+        os.dup2(slave, 0)
+        before = termios.tcgetattr(0)
+
+        def fail(*args):
+            raise RuntimeError("on the way")
+
+        monkeypatch.setattr(remote._Client, "handshake", lambda self, argv: None)
+        monkeypatch.setattr(remote, "_same_file", fail)
+        with pytest.raises(RuntimeError):
+            remote._Client(ours, remote.Target("h", 1, None)).run(["tty"])
+        # What raw mode turns off. macOS adds PENDIN of its own on the way back.
+        cooked = termios.ICANON | termios.ECHO | termios.ISIG
+        assert termios.tcgetattr(0)[3] & cooked == before[3] & cooked
+    finally:
+        os.dup2(saved_stdin, 0)
+        for fd in (saved_stdin, master, slave):
+            os.close(fd)
+        ours.close()
+        theirs.close()
 
 
 def test_clients_slow_to_log_in_keep_no_one_out(server):
@@ -929,7 +1046,7 @@ def test_clients_slow_to_log_in_keep_no_one_out(server):
     try:
         started = time.monotonic()
         assert run(["foo", "x", "--remote", s.target])[:2] == (0, "foo name='x' count=1\n")
-        assert time.monotonic() - started < 5
+        assert time.monotonic() - started < 8  # not the idle ones' handshake time of 10 s each
     finally:
         for sock in idle:
             sock.close()

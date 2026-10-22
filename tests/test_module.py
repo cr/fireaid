@@ -67,7 +67,8 @@ def test_version_is_our_own():
 
 def test_requirement_is_the_fire_with_plain_help():
     required = [r for r in metadata.requires("fireaid") if "extra ==" not in r]
-    assert required == ["fire>=0.2.0"]
+    # Fire before 0.7.0 does not import on Python 3.13 and later.
+    assert required == ["fire>=0.2.0", 'fire>=0.7.0; python_version >= "3.13"']
 
 
 @pytest.mark.parametrize(

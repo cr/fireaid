@@ -95,6 +95,10 @@ _CONNECT_TIMEOUT = 5.0
 _TRANSIENT = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.EADDRNOTAVAIL}
 _HANDSHAKE_TIMEOUT = 10.0
 _MAX_HANDSHAKES = 8  # clients logging in at once; more are turned away
+_BUSY_WAIT = 5.0  # how long a client logged in waits for the command before it, as one ends
+# How long a done command's output may stay quiet before what still holds
+# it open, something the command left running, is left behind.
+_LINGER = 0.5
 # A peer that vanished without a word is given up after a minute or so.
 _KEEPALIVE = (("TCP_KEEPIDLE", 30), ("TCP_KEEPALIVE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3))
 _TICK = 0.2
@@ -624,7 +628,8 @@ class _Session:
             return False
         if request is None:
             return False
-        if not busy.acquire(blocking=False):
+        # A command ending, such as one whose client has gone, takes a moment.
+        if not busy.acquire(timeout=_BUSY_WAIT):
             self.refuse("busy with another client's command; try again later", 1)
             return False
         self.request = request
@@ -915,6 +920,10 @@ class _PtyCommand(_Command):
             self.outputs[r] = STDERR
 
         try:
+            # Python warns that preexec_fn is not safe with threads, as the
+            # server's logins are: what runs in the child before exec could
+            # wait for a lock another thread held. _take_terminal takes none,
+            # and nothing else gives the command its controlling terminal.
             self.popen(
                 stdin=child[0],
                 stdout=child[1],
@@ -937,6 +946,11 @@ class _PtyCommand(_Command):
         selector = selectors.SelectSelector()
         try:
             while self.outputs or self.process.poll() is None:
+                if self.process.poll() is not None:
+                    # Done: what it wrote is in its outputs now. Something it
+                    # left running may hold them open, and is not waited for.
+                    self.drain(selector)
+                    break
                 _watch(selector, channel.sock,
                        selectors.EVENT_READ | (selectors.EVENT_WRITE if channel.outgoing else 0))
                 for fd in {*self.outputs, self.stdin} - {None}:
@@ -974,6 +988,22 @@ class _PtyCommand(_Command):
         if data:
             self.channel.queue(self.outputs[fd], data)
             return
+        self.close_output(selector, fd)
+
+    def drain(self, selector: selectors.BaseSelector) -> None:
+        """Pass on what the outputs hold, and close them."""
+        for fd in list(self.outputs):
+            for _ in range(_BACKLOG // _CHUNK):  # what writes on is cut short
+                try:
+                    data = os.read(fd, _CHUNK)
+                except OSError:  # nothing more now, or EIO
+                    break
+                if not data:
+                    break
+                self.channel.queue(self.outputs[fd], data)
+            self.close_output(selector, fd)
+
+    def close_output(self, selector: selectors.BaseSelector, fd: int) -> None:
         _watch(selector, fd, 0)
         kind = self.outputs.pop(fd)
         if kind == TTY:
@@ -1100,16 +1130,25 @@ class _PipeCommand(_Command):
     def relay(self) -> None:
         channel = self.channel
         sock = channel.sock
+        quiet = None  # since when the command is done and its output has not come on
         while self.readers or self.process.poll() is None:
+            came = False
             while len(channel.outgoing) < _BACKLOG:
                 try:
                     kind, data = self.output.get_nowait()
                 except queue.Empty:
                     break
+                came = True
                 if data is None:
                     self.readers -= 1
                 else:
                     channel.queue(kind, data)
+            if self.process.poll() is None or came or len(channel.outgoing) >= _BACKLOG:
+                quiet = None
+            elif quiet is None:
+                quiet = time.monotonic()
+            elif time.monotonic() - quiet >= _LINGER:
+                break  # something the command left running holds its output open
             _, writable, _ = select.select([sock], [sock] if channel.outgoing else [], [], _POLL)
             if writable:
                 channel.flush()
@@ -1250,26 +1289,6 @@ class _Client:
         flags = [os.isatty(fd) for fd in (0, 1, 2)]
         self.terminal = next((fd for fd in (1, 2, 0) if flags[fd]), 2)
         saved = None
-        if flags[0] and self.pty and termios is not None and not _like_windows():
-            # The command's terminal on the server does the echoing and
-            # the line editing; this one passes the keys on as they come.
-            try:
-                saved = termios.tcgetattr(0)
-                tty.setraw(0, termios.TCSADRAIN)
-            except termios.error:
-                saved = None
-        self.raw = saved is not None
-        request = {
-            "argv": argv,
-            "tty": flags,
-            "raw": self.raw,
-            "same": not flags[1] and not flags[2] and _same_file(1, 2),
-            "env": {k: os.environ[k] for k in TERMINAL_VARIABLES if k in os.environ},
-        }
-        size = self.size()
-        if size:
-            request["size"] = size
-
         handlers = {}
 
         def note(sig, frame):
@@ -1278,19 +1297,40 @@ class _Client:
         def leave(sig, frame):
             raise SystemExit(128 + sig)
 
-        wanted = [(signal.SIGINT, note), (signal.SIGTERM, leave)]
-        for name, handler in (("SIGWINCH", note), ("SIGHUP", leave)):
-            if hasattr(signal, name):
-                wanted.append((getattr(signal, name), handler))
-        for sig, handler in wanted:
-            try:
-                handlers[sig] = signal.signal(sig, handler)
-            except (ValueError, OSError):  # not the main thread
-                pass
         try:
+            if flags[0] and self.pty and termios is not None and not _like_windows():
+                # The command's terminal on the server does the echoing and
+                # the line editing; this one passes the keys on as they come.
+                try:
+                    saved = termios.tcgetattr(0)
+                    tty.setraw(0, termios.TCSADRAIN)
+                except termios.error:
+                    saved = None
+            self.raw = saved is not None
+            request = {
+                "argv": argv,
+                "tty": flags,
+                "raw": self.raw,
+                "same": not flags[1] and not flags[2] and _same_file(1, 2),
+                "env": {k: os.environ[k] for k in TERMINAL_VARIABLES if k in os.environ},
+            }
+            size = self.size()
+            if size:
+                request["size"] = size
+
+            wanted = [(signal.SIGINT, note), (signal.SIGTERM, leave)]
+            for name, handler in (("SIGWINCH", note), ("SIGHUP", leave)):
+                if hasattr(signal, name):
+                    wanted.append((getattr(signal, name), handler))
+            for sig, handler in wanted:
+                try:
+                    handlers[sig] = signal.signal(sig, handler)
+                except (ValueError, OSError):  # not the main thread
+                    pass
+
             self.channel.write(RUN, request)
             self.channel.sock.setblocking(False)
-            return self.relay(stdin_is_tty=flags[0])
+            return self.relay()
         finally:
             if saved is not None:
                 termios.tcsetattr(0, termios.TCSADRAIN, saved)
@@ -1332,11 +1372,11 @@ class _Client:
         message = _json(payload)
         raise RemoteError(f"{self.target}: {message.get('message')}", _integer(message, "code", 1))
 
-    def relay(self, stdin_is_tty: bool) -> int:
+    def relay(self) -> int:
         channel = self.channel
         sock = channel.sock
         threaded = _like_windows()  # stdin cannot be selected on Windows
-        chunks: queue.Queue = queue.Queue()
+        chunks: queue.Queue = queue.Queue(maxsize=4)  # the thread waits while the server does
         if threaded:
             threading.Thread(target=_read_stdin, args=(chunks,), daemon=True).start()
         reading_stdin = True
@@ -1360,31 +1400,37 @@ class _Client:
                         data = os.read(0, _CHUNK)
                     except OSError:
                         data = b""
-                    reading_stdin = self.take_input(data, stdin_is_tty)
+                    reading_stdin = self.take_input(data)
                 self.send_input()
                 while threaded and wanted():
                     try:
                         data = chunks.get_nowait()
                     except queue.Empty:
                         break
-                    reading_stdin = self.take_input(data, stdin_is_tty)
+                    reading_stdin = self.take_input(data)
                     self.send_input()
                 channel.flush()
         except EOFError as e:
             raise RemoteError(f"{self.target}: {str(e) or 'connection closed'}") from None
+        except _ProtocolError as e:
+            raise RemoteError(f"{self.target}: {e}") from None
         except BrokenPipeError:
             # Our own output has gone away. The server stops the command.
             return 128 + getattr(signal, "SIGPIPE", 13)
         return self.code
 
-    def take_input(self, data: bytes, stdin_is_tty: bool) -> bool:
-        """Take stdin's data, to send as the server asks for it. Returns whether there is more to read."""
+    def take_input(self, data: bytes) -> bool:
+        """
+        Take stdin's data, to send as the server asks for it. Returns
+        whether there is more to read. A terminal's end, Ctrl-D, goes on
+        as the end of the input: a raw one passes it on as a key instead.
+        """
         if data:
             if self.raw and self.escaped(data):
                 raise RemoteError(f"disconnected from {self.target}", 255)
             self.unsent += data
             return True
-        self.send_eof = not stdin_is_tty
+        self.send_eof = True
         return False
 
     def escaped(self, keys: bytes) -> bool:

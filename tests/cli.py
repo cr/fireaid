@@ -18,6 +18,8 @@ import fractions
 import ipaddress
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -132,6 +134,16 @@ class Probe(CLI):
             print("interrupted", file=sys.stderr, flush=True)
             sys.exit(130)
         return "slept"
+
+    def stubborn(self, seconds=30):
+        """Sleep, ignoring SIGHUP, as a command that cleans up first would."""
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        return self.sleep(seconds)
+
+    def spawn(self, seconds=15):
+        """Leave a process running, holding stdout and stderr, as a command starting a daemon would."""
+        subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+        return "spawned"
 
 
 class Configured(CLI):

@@ -3,7 +3,7 @@ PYTHON ?= python3
 PYTHON_MIN ?= python3.12
 VENV := .venv
 VENV_MIN := .venv-min
-FIRE_MIN := $(shell sed -n 's/^ *"fire>=\([^"]*\)".*/\1/p' pyproject.toml)
+FIRE_MIN := $(shell sed -n 's/^ *"fire>=\([0-9.]*\)",*$$/\1/p' pyproject.toml)
 
 .PHONY: test test-min clean
 

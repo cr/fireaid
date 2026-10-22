@@ -339,8 +339,8 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
         here. Its output, input and exit code are relayed, and it sees a
         terminal where the client has one: colour, progress bars, the
         terminal width, prompts and Ctrl-C work as they do locally.
-        One command runs at a time; a client that comes meanwhile is told
-        the server is busy. Where Ctrl-C is a key for the server's terminal,
+        One command runs at a time; a client that comes meanwhile waits a
+        few seconds, then is told the server is busy. Where Ctrl-C is a key for the server's terminal,
         Enter ~ . disconnects.{local}
 
         Args:

@@ -3,8 +3,10 @@ Running the test program, tests/cli.py. Not a test module itself.
 """
 
 import os
+import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -41,8 +43,9 @@ def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b""):
     """
     Run the test program with a terminal of 80x24 as stdin and stderr,
     and as stdout too unless stdout_tty is false: then stdout is a pipe.
-    Writes keys to the terminal once wait_for has appeared there.
-    Returns the exit code, the terminal's output and stdout's.
+    Writes keys to the terminal once wait_for has appeared there, at
+    once for b"". Returns the exit code, the terminal's output and
+    stdout's. A program still running after 30 seconds is killed.
     """
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -61,8 +64,14 @@ def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b""):
     finally:
         os.close(slave)
     output = b""
+    deadline = time.monotonic() + 30
     try:
-        while True:
+        while time.monotonic() < deadline:
+            if keys is not None and wait_for in output:
+                os.write(master, keys)
+                keys = None
+            if not select.select([master], [], [], 1)[0]:
+                continue
             try:
                 chunk = os.read(master, 4096)
             except OSError:
@@ -70,9 +79,8 @@ def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b""):
             if not chunk:
                 break
             output += chunk
-            if keys is not None and wait_for in output:
-                os.write(master, keys)
-                keys = None
+        else:
+            process.kill()
     finally:
         os.close(master)
     stdout = process.stdout.read().decode() if process.stdout else ""
