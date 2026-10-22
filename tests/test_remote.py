@@ -283,12 +283,27 @@ def test_variable_name():
         ("db-drop", False),
         ("db list", False),
         ("foo --remote x", True),
-        ("foo -- --remote x", False),
+        ("foo -- --remote x", True),  # nothing may follow the last separator
+        ("foo -- --help", True),
         ("foo -- --interactive", True),
         ("foo -- -i", True),
-        ("foo -- --int", True),
-        ("foo -- --trace", False),
-        ("foo -- -i -- x", False),  # Fire takes its flags from after the last separator
+        ("foo -- -vi", True),
+        ("foo -- --trace", True),
+        ("foo -- x", True),
+        ("foo -- -i -- x", True),
+        ("foo --", False),  # a trailing separator with nothing after it
+        ("foo -- --", False),
+        ("foo -- -i --", False),  # ... whatever came before it is the command's
+        ("foo x server", True),  # Fire chains commands: a method may return the tool
+        ("foo x server --help", True),
+        ("foo x help server", True),
+        ("help server --port 1", True),
+        ("server --help --", True),
+        ("server -h", False),
+        ("foo x firmware flash", True),
+        ("help foo firmware", True),
+        ("foo x db drop", True),
+        ("foo db-drop", False),
     ],
 )
 def test_refusal(command, refused):
@@ -451,7 +466,7 @@ def test_no_remote_flag_without_remote():
         "help foo",
         "foo --help",
         "help server",
-        "foo -- --help",
+        "foo x --",
         "",
         "nonesuch",
         "foo",
@@ -517,6 +532,20 @@ def test_denied(server, command):
     assert Log.refused(server().log.text, denied)
 
 
+@pytest.mark.parametrize("flags", [["-i"], ["-vi"], ["--interactive"], ["--help"], ["--trace"], ["x"]])
+def test_nothing_may_follow_the_separator(server, flags):
+    """
+    Fire's own flags follow the last separator, its interactive mode
+    among them: a Python shell on the server, outside any command. None
+    of them is needed remotely, so the server refuses them all rather
+    than telling them apart.
+    """
+    # --remote goes before the separator, so the client sends it to the server.
+    code, out, err = run(["foo", "--remote", server().target, "--", *flags])
+    assert (code, out) == (2, "")
+    assert "flags after -- are not available remotely" in err
+
+
 def test_password(server):
     s = server(password=True)
     assert run(["foo", "x", "--remote", s.target])[:2] == (0, "foo name='x' count=1\n")
@@ -533,6 +562,16 @@ def test_numeric_password_is_a_string(server):
     code, out, err = run(["foo", "x", "--remote", f"1000.0@127.0.0.1:{s.port}"])
     assert (code, out) == (1, "")
     assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
+
+
+def test_password_without_a_value_is_refused():
+    # A bare --password would be the password "True".
+    for argv in (["--password"], ["--password", "--port", "0"]):
+        process = subprocess.run(
+            [sys.executable, "cli.py", "server", "--bind", "127.0.0.1", *argv],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, env=environment("CLI"), cwd=TESTS, timeout=30,
+        )
+        assert (process.returncode, process.stdout, process.stderr) == (2, "", "SETUP debug=False\ncli.py: --password needs a value\n")
 
 
 def test_password_given_to_a_server_without_one_is_warned_about(server):
@@ -733,6 +772,34 @@ def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"
 def test_terminal(server):
     target = server("Probe").target
     assert on_terminal(["tty", "--remote", target]) == on_terminal(["tty"]) == (0, "111 80x24\n", "")
+
+
+@unix
+def test_client_pager_stays_on_the_client(server):
+    """
+    Fire runs $PAGER in a shell when it pages help on a terminal. A
+    client's PAGER would run on the server, as any command would: it
+    does not go along, so the command uses the server's.
+    """
+    target = server("Probe").target
+    pager = {"PAGER": "sed s/^/PAGED:/", "LC_CTYPE": "C.UTF-8"}
+    code, output, _ = on_terminal(["foo", "--help", "x"], **pager)
+    assert code == 0 and "PAGED:" in output  # locally, the program pages through it
+    code, output, _ = on_terminal(["foo", "--help", "x", "--remote", target], **pager)
+    assert code == 0 and "PAGED:" not in output and "foo" in output
+
+
+@unix
+def test_window_size_out_of_range_is_ignored():
+    master, slave = pty.openpty()
+    try:
+        remote._set_size(master, {"rows": 24, "cols": 80})
+        for size in ({"rows": 70000, "cols": 80}, {"rows": -1, "cols": 80}, {"rows": "x"}, None):
+            remote._set_size(master, size)
+        assert struct.unpack("HHHH", fcntl.ioctl(master, termios.TIOCGWINSZ, b"\0" * 8))[:2] == (24, 80)
+    finally:
+        os.close(master)
+        os.close(slave)
 
 
 @unix

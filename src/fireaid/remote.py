@@ -72,8 +72,8 @@ TERMINAL_VARIABLES = (
     "LC_CTYPE",
     "COLUMNS",
     "LINES",
-    "PAGER",
 )
+# Not PAGER: Fire runs it in a shell, so a client's would run on the server.
 
 # Messages. A frame is the length of what follows, the type, and the
 # payload: JSON for control messages, bytes for data.
@@ -220,35 +220,34 @@ def refusal(argv: Sequence[str], deny: Sequence[str]) -> str | None:
     """
     Tell why the server will not run a command line, or None if it will.
 
-    A deny entry names a command path, as words. It covers the command
-    lines that start with that path, help for them included. The server
-    command itself is denied unless help for it is asked for.
+    Nothing may follow the last ``--``. Fire's own flags go there, its
+    interactive mode among them, which is a Python shell; none is needed
+    remotely, as ``--help`` works without a separator. A deny entry
+    names a command path, as words. It covers every command line in
+    which those words appear in that order, help for them included:
+    Fire chains commands, so a denied command may be reached after
+    another. The server command itself is denied unless help for it is
+    asked for, in its plain forms.
     """
-    words = list(argv[: argv.index("--")]) if "--" in argv else list(argv)
+    argv = list(argv)
+    if "--" in argv:
+        last = len(argv) - 1 - argv[::-1].index("--")
+        if argv[last + 1 :]:
+            return "flags after -- are not available remotely; --help works without the separator"
+    words = argv[: argv.index("--")] if "--" in argv else argv
     if any(w == FLAG or w.startswith(FLAG + "=") for w in words):
         return f"{FLAG} cannot be passed on to the server"
-    if "--" in argv:
-        # Fire's own flags follow the last separator. Its interactive
-        # mode is a Python shell, which no deny list could contain.
-        last = len(argv) - 1 - argv[::-1].index("--")
-        for flag in argv[last + 1 :]:
-            if flag == "-i" or (len(flag) > 2 and "--interactive".startswith(flag)):
-                return "Fire's interactive mode is not available remotely"
 
     def fold(text: str) -> list[str]:
         return [w.replace("-", "_") for w in text.split()]
 
-    path = [w for w in words if not w.startswith("-")]
-    help_asked = path[:1] == ["help"] or ("--" in argv and "--help" in argv) or argv[-1:] in (["--help"], ["-h"])
-    if path[:1] == ["help"]:
-        path = path[1:]
-    path = fold(" ".join(path))
-
-    entries = list(deny) if help_asked else ["server", *deny]
-    for entry in entries:
+    path = fold(" ".join(w for w in words if not w.startswith("-")))
+    for entry in deny:
         steps = fold(entry)
-        if steps and path[: len(steps)] == steps:
+        if steps and any(path[i : i + len(steps)] == steps for i in range(len(path))):
             return f"'{entry}' is not available remotely"
+    if "server" in path and argv not in (["help", "server"], ["server", "--help"], ["server", "-h"]):
+        return "'server' is not available remotely"
     return None
 
 
@@ -390,6 +389,8 @@ def _set_size(fd: int, size: Any) -> None:
         rows, cols = int(size["rows"]), int(size["cols"])
     except (KeyError, TypeError, ValueError):
         return
+    if not (0 <= rows < 65536 and 0 <= cols < 65536):
+        return
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
@@ -436,6 +437,9 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
         logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, handlers=[handler])
     if launch.error:
         raise RemoteError(launch.error)
+    if password == "True":
+        # Fire gives a flag without a value the text True, as for a boolean.
+        raise RemoteError("--password needs a value", 2)
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536:
         raise RemoteError(f"{port!r} is not a port", 2)
 

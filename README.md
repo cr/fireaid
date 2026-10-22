@@ -184,15 +184,19 @@ typed there, and its output, input and exit code are relayed. Where the
 client has a terminal, the command gets one of the same size, so that
 colour, progress bars, line width, prompts and Ctrl-C work as they do
 locally; where the client has a pipe or a file, the command gets a pipe.
-The client's `TERM`, `NO_COLOR`, `FORCE_COLOR`, `COLUMNS`, locale and
-pager settings go along.
+The client's `TERM`, `NO_COLOR`, `FORCE_COLOR`, `COLUMNS` and locale
+settings go along, not its `PAGER`, which Fire runs in a shell.
 
 Commands that must only run locally are named in a `fireaid.Remote`:
 
     fire.Fire(MyTool, remote=fire.Remote(deny=("firmware",)))
 
-The server refuses them, help for them included. `fireaid.Remote` also
-sets the default port, 4247, and the name of the variable.
+The server refuses them wherever they appear on a command line, help
+for them included, since Fire chains commands. It also refuses
+anything after a `--`: Fire's own flags, its interactive Python shell
+among them, stay local, and `--help` works without the separator.
+`fireaid.Remote` also sets the default port, 4247, and the name of
+the variable.
 
 The server logs through the `fireaid.remote` logger: `Remote(setup=f)`
 names a function the server calls with its `--debug` flag before it
