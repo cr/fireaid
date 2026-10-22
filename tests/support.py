@@ -91,7 +91,10 @@ def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b"", resize=None
             process.kill()
     finally:
         os.close(master)
-    stdout = process.stdout.read().decode() if process.stdout else ""
+    stdout = ""
+    if process.stdout:
+        with process.stdout:
+            stdout = process.stdout.read().decode()
     return process.wait(30), output.decode().replace("\r\n", "\n"), stdout
 
 

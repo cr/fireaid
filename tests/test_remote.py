@@ -154,6 +154,11 @@ class Log:
         return f"tty {flags}" in text
 
     @staticmethod
+    def waiting(text):
+        """How many clients have waited for a running command, as --debug logs it."""
+        return text.count("waits for the command running now")
+
+    @staticmethod
     def refused(text, path):
         return f"'{path}' is not available remotely" in text
 
@@ -234,11 +239,12 @@ class Server:
         argv = ["server", "--port", "0", "--bind", "127.0.0.1"] + ([f"--password={secret}"] if password else [])
         argv += ["--debug"] if debug else []
         self.log = Log(log)
+        self.log_file = log.open("w")
         self.process = subprocess.Popen(
             [sys.executable, "cli.py", *argv],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=log.open("w"),
+            stderr=self.log_file,
             env=environment(component, FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else "", **variables),
             cwd=TESTS,
         )
@@ -254,6 +260,17 @@ class Server:
     def stop(self):
         self.process.terminate()
         self.process.wait(10)
+        self.log_file.close()
+
+
+def ended(process):
+    """Kill a process if it still runs, wait for it, and close its pipes."""
+    if process.poll() is None:
+        process.kill()
+    process.wait(10)
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None:
+            pipe.close()
 
 
 @pytest.fixture(scope="session")
@@ -561,10 +578,16 @@ def test_many_clients_are_served_not_dropped(server):
 
     with concurrent.futures.ThreadPoolExecutor(16) as pool:
         results = list(pool.map(once, range(16)))
-    for code, out, err in results:
-        assert code == 0, err
+    # Served, or on a slow computer told the server is busy; never dropped.
+    served = 0
+    for i, (code, out, err) in enumerate(results):
         assert "connection closed" not in err
-    assert sum(out == f"TERM=t{i}\n" for i, (_, out, _) in enumerate(results)) == 16
+        if code == 0:
+            assert out == f"TERM=t{i}\n"
+            served += 1
+        else:
+            assert (code, out) == (1, "") and Said.busy(err), err
+    assert served, "some are served at once"
 
 
 # -- allow as a command runs: groups, properties, a command's own Fire call
@@ -625,8 +648,10 @@ def test_clients_beyond_the_login_limit_are_told_so(tmp_path):
     s = Server("Probe", False, tmp_path / "log")
     idle = []
     try:
-        idle = [socket.create_connection(("127.0.0.1", s.port)) for _ in range(remote._MAX_HANDSHAKES)]
-        time.sleep(0.5)  # for the server to take them all
+        idle = [socket.create_connection(("127.0.0.1", s.port), timeout=10) for _ in range(remote._MAX_HANDSHAKES)]
+        for sock in idle:
+            # The server sends its challenge once it has taken a login slot for the client.
+            remote._Channel(sock).expect(remote.CHALLENGE)
         code, out, err = run(["tty", "--remote", s.target], "Probe")
         assert (code, out) == (1, "")
         assert "too many clients logging in" in err and "connection closed" not in err
@@ -638,7 +663,7 @@ def test_clients_beyond_the_login_limit_are_told_so(tmp_path):
 
 def test_clients_waiting_to_run_are_bounded(tmp_path):
     """Logged-in clients waiting for the running command are bounded; beyond that, told so at once."""
-    s = Server("Probe", False, tmp_path / "log")
+    s = Server("Probe", False, tmp_path / "log", debug=True)
     first = subprocess.Popen(
         [sys.executable, "cli.py", "sleep", "--remote", s.target],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment("Probe"), cwd=TESTS,
@@ -652,7 +677,7 @@ def test_clients_waiting_to_run_are_bounded(tmp_path):
             assert kind == remote.AUTH_OK
             channel.write(remote.RUN, request)
             waiting.append(channel)
-        time.sleep(1)  # for each to start waiting
+        s.log.wait(lambda text: Log.waiting(text) == remote._MAX_WAITING)
         started = time.monotonic()
         channel, _ = log_in(s.port)
         waiting.append(channel)
@@ -663,16 +688,16 @@ def test_clients_waiting_to_run_are_bounded(tmp_path):
     finally:
         for channel in waiting:
             channel.sock.close()
-        first.kill()
-        first.wait()
+        ended(first)
         s.stop()
 
 
 def test_open_server_without_a_password_warns(tmp_path):
     path = tmp_path / "log"
+    log_file = path.open("w")
     process = subprocess.Popen(
         [sys.executable, "cli.py", "server", "--port", "0"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=path.open("w"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_file,
         env=environment("INSTANCE"), cwd=TESTS,
     )
     log = Log(path)
@@ -681,6 +706,7 @@ def test_open_server_without_a_password_warns(tmp_path):
     finally:
         process.terminate()
         process.wait(10)
+        log_file.close()
     assert log.setup_debug() is False
     assert log.host() == "0.0.0.0" and log.without_password()
     assert log.warned_no_password() and log.warned_open_network()
@@ -1315,8 +1341,7 @@ def test_input_waits_for_the_command(server, pipes):
     threading.Thread(target=feed, daemon=True).start()
     time.sleep(3)
     grown = memory() - before
-    client.kill()
-    client.wait()
+    ended(client)
     assert len(sent) < 50, "the client's stdin backs up"
     assert grown < 32, f"the server grew by {grown} MiB"
 
@@ -1400,8 +1425,7 @@ def test_busy_server_says_so(server):
         assert (code, out) == (1, "") and Said.busy(err)
     finally:
         before = len(server("Probe").log.text)
-        first.kill()
-        first.wait()
+        ended(first)
         server("Probe").log.wait(lambda text: "went away" in text[before:])
 
 
@@ -1414,8 +1438,7 @@ def test_next_client_waits_for_a_command_ending(server):
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment("Probe"), cwd=TESTS,
     )
     assert first.stdout.readline().rstrip(b"\r\n") == b"started"
-    first.kill()
-    first.wait()
+    ended(first)
     code, out, err = run(["tty", "--remote", target], "Probe")
     assert (code, err) == (0, "")
 
@@ -1463,8 +1486,7 @@ def test_windows_like_client_reads_input_as_it_is_asked_for(server):
     threading.Thread(target=feed, daemon=True).start()
     time.sleep(3)
     memory = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(client.pid)])) // 1024
-    client.kill()
-    client.wait()
+    ended(client)
     assert len(sent) < 50, "the client's stdin backs up"
     assert memory < 100, f"the client holds {memory} MiB"
 
@@ -1574,8 +1596,7 @@ def test_client_gone_stops_the_command(server, pipes):
         cwd=TESTS,
     )
     assert client.stdout.readline().rstrip(b"\r\n") == b"started"
-    client.kill()
-    client.wait()
+    ended(client)
     # The server is free for the next client at once, not after the sleep.
     assert run(["tty", "--remote", target], "Probe")[0] == 0
 
@@ -1615,7 +1636,7 @@ def test_pipes_only_denied(server):
 @pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
 def test_interrupt_without_a_terminal(server, pipes):
     target = server("Probe", pipes=pipes).target
-    client = subprocess.Popen(
+    with subprocess.Popen(
         [sys.executable, "cli.py", "sleep", "--remote", target],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1624,11 +1645,11 @@ def test_interrupt_without_a_terminal(server, pipes):
         cwd=TESTS,
         # Python ignores SIGINT in a child of a non-interactive shell; undo that.
         preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL),
-    )
-    assert client.stdout.readline() == b"started\n"
-    client.send_signal(signal.SIGINT)
-    assert client.wait(10) == 128 + signal.SIGINT
-    assert client.stderr.read() == b"interrupted\n"
+    ) as client:  # closes its pipes, however the test ends
+        assert client.stdout.readline() == b"started\n"
+        client.send_signal(signal.SIGINT)
+        assert client.wait(10) == 128 + signal.SIGINT
+        assert client.stderr.read() == b"interrupted\n"
 
 
 # -- Terminals

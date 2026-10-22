@@ -696,7 +696,10 @@ class _Session:
             self.refuse("the server has too many clients waiting; try again later", 1)
             return False
         try:
+            if busy.acquire(blocking=False):
+                return True
             # A command ending, such as one whose client has gone, takes a moment.
+            logger.debug(f"{self.peer} waits for the command running now")
             if busy.acquire(timeout=_BUSY_WAIT):
                 return True
         finally:
