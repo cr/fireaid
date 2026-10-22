@@ -113,8 +113,13 @@ class Log:
     def pipes_only(self):
         return "pipes" in self.serving().group("notes")
 
-    def warned_open(self):
-        return "anyone who can reach this port" in self.text
+    # The two warnings name the flag that silences them; the prose may change.
+
+    def warned_no_password(self):
+        return "--password" in self.text
+
+    def warned_open_network(self):
+        return "--bind 127.0.0.1" in self.text
 
     # -- clients and commands
 
@@ -319,13 +324,13 @@ def test_open_server_without_a_password_warns(tmp_path):
     )
     log = Log(log)
     try:
-        log.wait(lambda text: "anyone who can reach" in text)
+        log.wait(lambda text: Log(log.path).warned_no_password() and Log(log.path).warned_open_network())
     finally:
         process.terminate()
         process.wait(10)
     assert log.setup_debug() is False
     assert log.host() == "0.0.0.0" and log.without_password()
-    assert log.warned_open()
+    assert log.warned_no_password() and log.warned_open_network()
 
 
 def test_connection_closed_before_the_handshake_is_no_refusal(server):
@@ -577,7 +582,8 @@ def test_password_without_a_value_is_refused():
 def test_password_given_to_a_server_without_one_is_warned_about(server):
     s = server()
     assert s.log.without_password()
-    assert not s.log.warned_open()  # it listens on loopback
+    assert s.log.warned_no_password()
+    assert not s.log.warned_open_network()  # it listens on loopback
     code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
     assert (code, out) == (0, "foo name='x' count=1\n")
     assert err == f"warning: {s.target} asks for no password; the one given is not used\n"

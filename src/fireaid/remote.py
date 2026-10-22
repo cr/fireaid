@@ -462,9 +462,11 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
     notes = "" if password is not None else ", no password"
     notes += "" if _pty_available() else ", commands get pipes"
     logger.info(f"serving on {host}:{listener.getsockname()[1]}{notes}")
-    if password is None and not host.startswith("127."):
-        logger.warning(f"anyone who can reach this port may run {prog} commands here; "
-                       "--password asks them for a password, --bind 127.0.0.1 keeps it to this computer")
+    if password is None:
+        logger.warning("--password provides cleartext authentication (low protection); ")
+    if not host.startswith("127."):
+        logger.warning(f"the command server is unencrypted, do not use over untrusted networks; "
+                       "--bind 127.0.0.1 restricts access to localhost")
     logger.debug(f"starting {' '.join(launch.prefix)} in {launch.cwd} for each command")
     listener.settimeout(1.0)  # so that Ctrl-C gets through on Windows
     try:
