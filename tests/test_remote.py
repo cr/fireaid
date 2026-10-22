@@ -161,6 +161,60 @@ class Log:
         return f"'{path}' is not available remotely" in text
 
 
+class Said:
+    """
+    What the client says on stderr, and what help shows.
+
+    Their wording is pinned here and nowhere else, as the server's is in
+    Log, so that a rewording changes one place. Tests ask whether
+    something was said.
+    """
+
+    # -- the client's stderr
+
+    @staticmethod
+    def refused(err):
+        """The server refused the command line, and the client named the server."""
+        return re.fullmatch(r"cli\.py: 127\.0\.0\.1:\d+: [^\n]*(is|are) not available remotely[^\n]*\n", err) is not None
+
+    @staticmethod
+    def refused_after_separator(err):
+        return Said.refused(err) and "after --" in err
+
+    @staticmethod
+    def authentication_failed(err, port):
+        return err == f"cli.py: 127.0.0.1:{port}: authentication failed\n"
+
+    @staticmethod
+    def password_unused(err, target):
+        return err == f"warning: {target} asks for no password; the one given is not used\n"
+
+    @staticmethod
+    def unreachable(err, target):
+        return err.startswith(f"cli.py: cannot reach {target}: ")
+
+    @staticmethod
+    def needs_value(err, flag):
+        return err.endswith(f"cli.py: {flag} needs a value\n")
+
+    # -- help
+
+    @staticmethod
+    def lists_command(out, name):
+        """The command is listed, with a summary line under it."""
+        return re.search(rf"^ +{re.escape(name)}\n +\S", out, re.M) is not None
+
+    @staticmethod
+    def lists_flag(out, name):
+        return f"--{name}=" in out
+
+    @staticmethod
+    def local_only(out):
+        """The commands the help says only run locally."""
+        m = re.search(r"only run locally: ([^\n]*)\.", out)
+        return [] if m is None else [name.strip() for name in m.group(1).split(",")]
+
+
 class Server:
     def __init__(self, component, password, log, pipes=False, debug=False):
         # Loopback, so that no firewall asks about the tests.
@@ -400,7 +454,7 @@ def test_server_listens_everywhere_by_default():
     assert parameters["bind"].default == "0.0.0.0"
     assert parameters["password"].default is None
     out = run(["help", "server"], "INSTANCE")[1]
-    assert "--bind=BIND" in out and "all of this computer's by default" in out
+    assert Said.lists_flag(out, "bind")
 
 
 # -- What Fire() makes of remote=
@@ -425,9 +479,9 @@ def test_remote_off_leaves_the_flag_to_fire():
 
 def test_server_is_a_command():
     code, out, err = run(["help"], "INSTANCE")
-    assert "     server\n       Serve the commands of this program" in out
+    assert Said.lists_command(out, "server")
     code, out, err = run(["help", "server"], "INSTANCE")
-    assert "CLI_REMOTE" in out and "These commands only run locally: static." in out
+    assert "CLI_REMOTE" in out and Said.local_only(out) == ["static"]
 
 
 REMOTE_FLAG = "\n    --remote=[PASSWORD@]HOST[:PORT]\n"
@@ -532,7 +586,7 @@ def test_merged_output_keeps_its_order(server):
 def test_denied(server, command):
     code, out, err = run([*command.split(), "--remote", server().target])
     assert (code, out) == (2, "")
-    assert err.startswith("cli.py: 127.0.0.1:") and "is not available remotely" in err
+    assert Said.refused(err)
     denied = "server" if command.startswith("server") else "static"
     assert Log.refused(server().log.text, denied)
 
@@ -548,7 +602,7 @@ def test_nothing_may_follow_the_separator(server, flags):
     # --remote goes before the separator, so the client sends it to the server.
     code, out, err = run(["foo", "--remote", server().target, "--", *flags])
     assert (code, out) == (2, "")
-    assert "flags after -- are not available remotely" in err
+    assert Said.refused_after_separator(err)
 
 
 def test_password(server):
@@ -557,7 +611,7 @@ def test_password(server):
     for target in (f"wrong@127.0.0.1:{s.port}", f"127.0.0.1:{s.port}"):
         code, out, err = run(["foo", "x", "--remote", target])
         assert (code, out) == (1, "")
-        assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
+        assert Said.authentication_failed(err, s.port)
 
 
 def test_numeric_password_is_a_string(server):
@@ -566,7 +620,7 @@ def test_numeric_password_is_a_string(server):
     assert run(["foo", "x", "--remote", s.target])[:2] == (0, "foo name='x' count=1\n")
     code, out, err = run(["foo", "x", "--remote", f"1000.0@127.0.0.1:{s.port}"])
     assert (code, out) == (1, "")
-    assert err == f"cli.py: 127.0.0.1:{s.port}: authentication failed\n"
+    assert Said.authentication_failed(err, s.port)
 
 
 def test_password_without_a_value_is_refused():
@@ -576,7 +630,8 @@ def test_password_without_a_value_is_refused():
             [sys.executable, "cli.py", "server", "--bind", "127.0.0.1", *argv],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, env=environment("CLI"), cwd=TESTS, timeout=30,
         )
-        assert (process.returncode, process.stdout, process.stderr) == (2, "", "SETUP debug=False\ncli.py: --password needs a value\n")
+        assert (process.returncode, process.stdout) == (2, "")
+        assert process.stderr.startswith("SETUP debug=False\n") and Said.needs_value(process.stderr, "--password")
 
 
 def test_password_given_to_a_server_without_one_is_warned_about(server):
@@ -586,13 +641,13 @@ def test_password_given_to_a_server_without_one_is_warned_about(server):
     assert not s.log.warned_open_network()  # it listens on loopback
     code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
     assert (code, out) == (0, "foo name='x' count=1\n")
-    assert err == f"warning: {s.target} asks for no password; the one given is not used\n"
+    assert Said.password_unused(err, s.target)
 
 
 def test_unreachable():
     code, out, err = run(["foo", "x", "--remote", "127.0.0.1:1"])
     assert code == 1
-    assert err.startswith("cli.py: cannot reach 127.0.0.1:1: 127.0.0.1: ")
+    assert Said.unreachable(err, "127.0.0.1:1")
 
 
 def test_connect_retries_transient_errors_and_names_each_address(monkeypatch):
@@ -706,7 +761,7 @@ def test_input_and_exit_code_between_kinds(server, pipes, client):
 def test_pipes_only_denied_and_password(server):
     s = server(pipes=True)
     code, out, err = run(["static", "bar", "--remote", s.target])
-    assert (code, out) == (2, "") and "is not available remotely" in err
+    assert (code, out) == (2, "") and Said.refused(err)
 
 
 @unix
