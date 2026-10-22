@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: Software Development :: User Interfaces",
 ]
 dependencies = [
-    "fire>=0.2.0",
+    "fire>=0.7.1",
     # Fire before 0.7.0 imports pipes, which Python 3.13 removed.
     "fire>=0.7.0; python_version >= '3.13'",
 ]
