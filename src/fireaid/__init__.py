@@ -43,7 +43,11 @@ Values are read as the parameters' type hints say, where Fire reads
 every value as a Python literal.
 
 ``Fire(component, remote=True)`` adds a ``server`` command and a
-``--remote`` flag, which runs a command line on such a server.
+``--remote`` flag, which runs a command line on such a server. Remote
+control is off unless the program's own call of Fire turns it on so:
+without that there is no server command, ``--remote`` is a flag like
+any other, and fireaid.remote is not even imported. Nothing outside
+the program, no flag and no environment variable, turns it on.
 """
 
 from __future__ import annotations
@@ -275,8 +279,13 @@ class Remote:
     """
     How a program is controlled remotely, for ``Fire(..., remote=Remote(...))``.
 
-    ``deny`` names command paths that only run locally, each as its
-    words, such as ``("firmware",)`` or ``("db drop",)``. ``port`` is the
+    ``allow``, if given, names the only command paths that run remotely,
+    each as its words, such as ``("status", "db list")``: a command line
+    must start with one of them. It is what to use for a program that
+    controls something physical, so that a new command stays local
+    until it is allowed. ``deny`` names command paths that only run
+    locally, such as ``("firmware",)`` or ``("db drop",)``, wherever they
+    appear on a command line, allowed or not. ``port`` is the
     default port of server and client. ``env`` names the variable a
     client takes ``--remote`` from, by default the program's name in
     capitals followed by ``_REMOTE``. ``setup``, if given, is called with
@@ -288,10 +297,29 @@ class Remote:
     port: int = 4247
     env: Any = None
     setup: Any = None
+    allow: Any = None
+
+    def __post_init__(self) -> None:
+        # A single string would be taken letter by letter: an allow list
+        # that allows nothing meant, or a deny list that denies nothing.
+        for name in ("deny", "allow"):
+            value = getattr(self, name)
+            if value is None and name == "allow":
+                continue
+            if isinstance(value, str) or not all(isinstance(entry, str) for entry in value):
+                raise TypeError(f"{name} must be a tuple of command paths, such as ('status',), not {value!r}")
+            object.__setattr__(self, name, tuple(value))
 
 
 def _remote_config(remote: Any) -> Any:
-    """A Remote for the remote argument of Fire(), or None."""
+    """
+    A Remote for the remote argument of Fire(), or None for none.
+
+    This is the one place that decides whether a program is remote
+    controlled, and only True or a Remote instance makes it so. Anything
+    else that might pass for yes, such as 1, "yes" or the Remote class
+    itself, is an error rather than a guess.
+    """
     if remote is False or remote is None:
         return None
     if remote is True:
@@ -302,7 +330,7 @@ def _remote_config(remote: Any) -> Any:
 
 
 def _remote_module() -> Any:
-    """fireaid.remote, imported only for a program that asks for remote control."""
+    """fireaid.remote, imported only once _remote_config has found remote control turned on."""
     return importlib.import_module(__name__ + ".remote")
 
 
@@ -314,16 +342,19 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
         if remote.setup is not None:
             remote.setup(bool(debug))
         try:
-            module.serve(launch, remote.deny, prog, variable, port, password, bind, bool(debug))
+            module.serve(launch, remote.deny, remote.allow, prog, variable, port, password, bind, bool(debug))
         except module.RemoteError as e:
             print(f"{prog}: {e}", file=sys.stderr)
             raise SystemExit(e.code) from None
 
     secret = _remote_module().password_variable(prog)
     local = ""
+    if remote.allow is not None:
+        names = ", ".join(remote.allow) or "none"
+        local += f"\n\n        Only these commands run remotely: {names}."
     if remote.deny:
         names = ", ".join(remote.deny)
-        local = f"\n\n        These commands only run locally: {names}."
+        local += f"\n\n        These commands only run locally: {names}."
     server.__doc__ = f"""Serve the commands of this program to other computers.
 
         A client runs a command here by adding --remote [PASSWORD@]HOST[:PORT]
@@ -521,7 +552,7 @@ class _HelpText:
         self.color_usage = color_usage
         self.color_help = color_help
         self.conventional = conventional  # help was asked for in fireaid's syntax
-        self.remote = remote  # (prog, variable, deny) of a remote-controlled program
+        self.remote = remote  # (prog, variable, deny, allow) of a remote-controlled program
 
     def __getattr__(self, name: str) -> Any:
         return getattr(_helptext, name)
@@ -551,18 +582,19 @@ def _section(sections: Sequence[str], heading: str) -> Any:
     return next((i for i, s in enumerate(sections) if s.startswith(heading + "\n")), None)
 
 
-def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Sequence[str], color: bool) -> str:
+def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Sequence[str], allow: Any,
+                      color: bool) -> str:
     """
     Add --remote to the flags in the help for what can run remotely: the
     program, its groups and commands, other than help, the server and
-    what the program denies.
+    what the program denies or, with an allow list, does not allow.
     """
     try:
         command = trace.GetCommand(include_separators=False)
     except AttributeError:
         return text
     words = shlex.split(command)[1:]
-    if words[:1] == ["help"] or _remote_module().refusal(words, deny) is not None:
+    if words[:1] == ["help"] or _remote_module().refusal(words, deny, allow) is not None:
         return text
     placeholder = "[PASSWORD@]HOST[:PORT]"
     entry = (f"    --remote={_placeholder(placeholder) if color else placeholder}\n"
@@ -650,7 +682,9 @@ _FIRE_SIGNATURE = inspect.signature(_fire.Fire)
 #
 # Values are read as the parameters' type hints say. With ``remote``,
 # True or a ``fireaid.Remote``, the program gets a ``server`` command
-# and a ``--remote [PASSWORD@]HOST[:PORT]`` flag.
+# and a ``--remote [PASSWORD@]HOST[:PORT]`` flag. Remote control is off
+# otherwise: remote is keyword-only, False by default, and everything
+# remote below depends on what _remote_config makes of it.
 def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
     remote = _remote_config(remote)
     bound = _FIRE_SIGNATURE.bind_partial(*args, **kwargs)
@@ -697,7 +731,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         launch = module.Launch.capture()
         component, undo_server = _add_member(component, "server", _server_command(remote, prog, variable, launch))
         arguments["component"] = component
-        remote_help = (prog, variable, remote.deny)
+        remote_help = (prog, variable, remote.deny, remote.allow)
 
     ours = not (inspect.isroutine(component) or _member(component, "help")[0])
     undo = None

@@ -8,6 +8,7 @@ one on Windows, so that the two kinds are tested against each other.
 """
 
 import errno
+import importlib.util
 import inspect
 import os
 import re
@@ -379,6 +380,88 @@ def test_refusal(command, refused):
     assert (remote.refusal(command.split(), ["firmware", "db drop"]) is not None) == refused
 
 
+@pytest.mark.parametrize(
+    "command, refused",
+    [
+        ("status", False),
+        ("status x", False),
+        ("status --help", False),
+        ("help status", False),
+        ("db list --all", False),
+        ("db-list", True),  # one word, not the path db list
+        ("db", True),  # the group, where only db list is allowed
+        ("db drop", True),
+        ("help db", True),
+        ("brightness 70", True),
+        ("Status", True),
+        # The program's help and usage, and help for help and the server.
+        ("", False),
+        ("help", False),
+        ("--help", False),
+        ("help help", False),
+        ("help server", False),
+        ("server --help", False),
+        ("server", True),
+        # What is denied stays denied, allowed or not, anywhere.
+        ("status x firmware", True),
+        # A flag's value before the command cannot be told from a command.
+        ("--level 1 status", True),
+        ("--verbose status", False),
+    ],
+)
+def test_refusal_with_an_allow_list(command, refused):
+    assert (remote.refusal(command.split(), ["firmware"], ["status", "db list"]) is not None) == refused
+
+
+def test_refusal_names_what_is_not_allowed():
+    assert remote.refusal(["brightness", "70"], [], ["status"]) == "'brightness' is not available remotely"
+    assert remote.refusal(["help", "brightness"], [], ["status"]) == "'brightness' is not available remotely"
+    assert remote.refusal(["--level", "1", "status"], [], ["status"]) == (
+        "'1' is not available remotely; a flag with a value goes after the command")
+
+
+def test_an_empty_allow_list_allows_no_command():
+    assert remote.refusal(["status"], [], []) is not None
+    assert remote.refusal(["help"], [], []) is None
+
+
+@pytest.mark.parametrize("lists", [{"deny": "firmware"}, {"allow": "status"}, {"allow": ["status", 1]},
+                                   {"deny": None}], ids=repr)
+def test_lists_are_command_paths(lists):
+    """A single string would be read letter by letter, and allow or deny nothing meant."""
+    with pytest.raises(TypeError):
+        fireaid.Remote(**lists)
+
+
+def test_lists_become_tuples():
+    assert fireaid.Remote().allow is None and fireaid.Remote().deny == ()
+    assert fireaid.Remote(allow=["status"], deny=["firmware"]) == fireaid.Remote(allow=("status",), deny=("firmware",))
+
+
+def test_help_lists_the_remote_flag_for_what_is_allowed():
+    allow = {"FIREAID_TEST_ALLOW": "foo,dynamic bar"}
+    assert REMOTE_FLAG in run(["help", "foo"], "INSTANCE", **allow)[1]
+    assert REMOTE_FLAG in run(["help", "dynamic", "bar"], "INSTANCE", **allow)[1]
+    assert REMOTE_FLAG not in run(["help", "grep"], "INSTANCE", **allow)[1]
+    assert REMOTE_FLAG not in run(["help", "dynamic", "hosty"], "INSTANCE", **allow)[1]
+    out = run(["help", "server"], "INSTANCE", **allow)[1]
+    assert "Only these commands run remotely: foo, dynamic bar." in out
+    assert Said.local_only(out) == ["static"]
+
+
+def test_server_runs_only_what_is_allowed(tmp_path):
+    s = Server("CLI", False, tmp_path / "log", FIREAID_TEST_ALLOW="foo,dynamic bar")
+    try:
+        assert run(["foo", "x", "--remote", s.target]) == run(["foo", "x"])
+        assert run(["dynamic", "bar", "--remote", s.target]) == run(["dynamic", "bar"])
+        code, out, err = run(["grep", "pat", "--remote", s.target])
+        assert (code, out) == (2, "") and Said.refused(err)
+        assert Log.refused(s.log.text, "grep")
+        assert run(["help", "server", "--remote", s.target])[0] == 0
+    finally:
+        s.stop()
+
+
 def test_open_server_without_a_password_warns(tmp_path):
     path = tmp_path / "log"
     process = subprocess.Popen(
@@ -518,6 +601,66 @@ def test_no_remote_flag_where_it_does_not_run_remotely(command):
 
 def test_no_remote_flag_without_remote():
     assert "--remote" not in run(["help", "foo"], FIREAID_TEST_REMOTE="")[1]
+
+
+# -- Off unless the program turns it on, in its own call of Fire
+
+
+class Plain:
+    def foo(self):
+        return "foo"
+
+
+@pytest.mark.parametrize("value", [1, "yes", "True", fireaid.Remote, object()], ids=repr)
+def test_only_true_or_a_remote_turns_it_on(value):
+    """What might pass for yes is an error, not a guess."""
+    with pytest.raises(TypeError):
+        fireaid.Fire(Plain, command=["foo"], remote=value)
+
+
+def test_remote_is_never_given_by_position():
+    with pytest.raises(TypeError):
+        fireaid.Fire(Plain, ["foo"], "tool", None, True)
+
+
+def test_nothing_from_outside_turns_it_on():
+    """
+    Without remote=, --remote is the program's flag like any other,
+    CLI_REMOTE its variable, and there is no server command.
+    """
+    off = {"FIREAID_TEST_REMOTE": "", "CLI_REMOTE": "127.0.0.1:1"}
+    assert run(["kw", "--remote", "127.0.0.1:1"], **off) == (0, "kw [('remote', '127.0.0.1:1')]\n", "")
+    assert run(["foo", "x"], **off) == (0, "foo name='x' count=1\n", "")
+    code, out, err = run(["server"], **off)
+    assert (code, out) == (2, "") and "Could not consume arg: server" in err
+    assert not Said.lists_command(run(["help"], "INSTANCE", **off)[1], "server")
+
+
+def test_remote_code_is_not_even_loaded_without_remote(tmp_path):
+    program = tmp_path / "prog.py"
+    program.write_text(
+        "import sys, fireaid\n"
+        "class P:\n"
+        "    def foo(self):\n"
+        "        return 'foo'\n"
+        "fireaid.Fire(P, command=['foo'])\n"
+        "try:\n"
+        "    fireaid.Fire(P, command=['--help'])\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "print('fireaid.remote' in sys.modules, file=sys.stderr)\n"
+    )
+    completed = subprocess.run([sys.executable, str(program)], capture_output=True, text=True, cwd=TESTS,
+                               env=environment("CLI", PROG_REMOTE="127.0.0.1:1"), stdin=subprocess.DEVNULL)
+    assert completed.stderr == "False\n"
+
+
+@pytest.mark.skipif(importlib.util.find_spec("fire.__main__") is None, reason="this Fire has no python -m fire")
+def test_python_m_fireaid_has_no_remote_control():
+    completed = subprocess.run([sys.executable, "-m", "fireaid", "cli.py", "CLI", "kw", "--remote", "127.0.0.1:1"],
+                               capture_output=True, text=True, cwd=TESTS, env=environment("CLI"),
+                               stdin=subprocess.DEVNULL)
+    assert (completed.returncode, completed.stdout) == (0, "kw [('remote', '127.0.0.1:1')]\n")
 
 
 # -- Command lines run remotely as locally

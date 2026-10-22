@@ -6,7 +6,8 @@ component passed to Fire(), NONE standing for no component at all.
 FIREAID_TEST_HELP gives the component fireaid's help command up front,
 to see what Fire makes of it as a command like any other.
 FIREAID_TEST_REMOTE makes it a remote-controlled program, whose group
-static only runs locally.
+static only runs locally. FIREAID_TEST_ALLOW, commas between command
+paths, is then all that runs remotely.
 """
 
 from __future__ import annotations  # annotations are strings, as in most programs
@@ -260,6 +261,8 @@ if __name__ == "__main__":
         if os.environ.get("FIREAID_TEST_REMOTE"):
             def setup(debug):
                 print(f"SETUP debug={debug}", file=sys.stderr, flush=True)
-            fire.Fire(component, remote=fire.Remote(deny=("static",), setup=setup))
+            allow = os.environ.get("FIREAID_TEST_ALLOW")
+            allow = tuple(allow.split(",")) if allow is not None else None
+            fire.Fire(component, remote=fire.Remote(deny=("static",), allow=allow, setup=setup))
         else:
             fire.Fire(component)

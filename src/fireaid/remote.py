@@ -9,7 +9,8 @@ output and error are terminals or pipes as the client's are, so that
 the program behaves as it does locally. A server on Windows, which has
 no pseudo-terminals, gives every command pipes.
 
-Imported by fireaid when a program asks for it.
+Imported by fireaid only when a program asks for it in its call of
+fire.Fire; nothing outside the program turns remote control on.
 """
 
 from __future__ import annotations
@@ -232,7 +233,7 @@ def take_flag(command: Sequence[str], prog: str, default_port: int, variable: st
         raise RemoteError(f"{source}: {e}", 2) from None
 
 
-def refusal(argv: Sequence[str], deny: Sequence[str]) -> str | None:
+def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | None = None) -> str | None:
     """
     Tell why the server will not run a command line, or None if it will.
 
@@ -244,6 +245,13 @@ def refusal(argv: Sequence[str], deny: Sequence[str]) -> str | None:
     Fire chains commands, so a denied command may be reached after
     another. The server command itself is denied unless help for it is
     asked for, in its plain forms.
+
+    Where there is an allow list, a command line must start with one of
+    its command paths, or ask for help for one; what a chain reaches
+    from there is that command's. The program's own help and usage, and
+    help for help and the server, are always there. A flag's value
+    before the command cannot be told from a command word, so such a
+    flag goes after it.
     """
     argv = list(argv)
     if "--" in argv:
@@ -264,6 +272,13 @@ def refusal(argv: Sequence[str], deny: Sequence[str]) -> str | None:
             return f"'{entry}' is not available remotely"
     if "server" in path and argv not in (["help", "server"], ["server", "--help"], ["server", "-h"]):
         return "'server' is not available remotely"
+    if allow is not None:
+        command = path[1:] if path[:1] == ["help"] else path
+        if command and command[0] not in ("help", "server") and not any(
+                command[: len(steps)] == steps for steps in map(fold, allow) if steps):
+            shown = [w for w in words if not w.startswith("-")]
+            hint = "; a flag with a value goes after the command" if words[0].startswith("-") else ""
+            return f"'{shown[len(path) - len(command)]}' is not available remotely{hint}"
     return None
 
 
@@ -491,8 +506,8 @@ def _plain_logging(prog: str, debug: bool) -> None:
     logger.propagate = False
 
 
-def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: Any, password: Any, bind: Any,
-          debug: bool) -> None:
+def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog: str, variable: str, port: Any,
+          password: Any, bind: Any, debug: bool) -> None:
     """Run the server until interrupted.
 
     It logs through the ``fireaid.remote`` logger. A program that has not
@@ -547,7 +562,7 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
     stopping = threading.Event()
 
     def admit(sock: socket.socket, peer: Any) -> None:
-        session = _Session(sock, peer, launch, deny, hidden, password)
+        session = _Session(sock, peer, launch, deny, allow, hidden, password)
         try:
             if session.admit(busy):
                 ready.put(session)
@@ -600,13 +615,14 @@ def serve(launch: Launch, deny: Sequence[str], prog: str, variable: str, port: A
 class _Session:
     """One client, one command."""
 
-    def __init__(self, sock: socket.socket, peer: Any, launch: Launch, deny: Sequence[str], hidden: Sequence[str],
-                 password: str | None) -> None:
+    def __init__(self, sock: socket.socket, peer: Any, launch: Launch, deny: Sequence[str],
+                 allow: Sequence[str] | None, hidden: Sequence[str], password: str | None) -> None:
         self.channel = _Channel(sock)
         self.address = peer
         self.peer = peer[0]
         self.launch = launch
         self.deny = deny
+        self.allow = allow
         self.hidden = hidden
         self.password = password
         self.request: dict = {}
@@ -699,7 +715,7 @@ class _Session:
             raise _ProtocolError("bad environment")
         request["env"] = {k: v for k, v in env.items() if k in TERMINAL_VARIABLES and isinstance(v, str)}
 
-        reason = refusal(argv, self.deny)
+        reason = refusal(argv, self.deny, self.allow)
         if reason:
             self.refuse(reason, 2)
             return None
