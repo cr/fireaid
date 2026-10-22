@@ -42,7 +42,7 @@ def test_attributes_are_fires():
     assert fireaid.decorators is fire.decorators
     assert set(dir(fire)) <= set(dir(fireaid))
     with pytest.raises(AttributeError):
-        fireaid.nonesuch
+        fireaid.nonesuch  # noqa: B018 - the access is the test
 
 
 def test_submodules_are_fires():
@@ -303,3 +303,39 @@ def test_remote_config():
     assert fireaid._remote_config(None) is None
     with pytest.raises(TypeError):
         fireaid._remote_config("boat")
+
+
+def test_fire_hook_points():
+    """
+    What fireaid stands in for while Fire runs, and what it reads from
+    Fire, by name and by the parameters it relies on. A Fire that renames
+    one fails here, not in a program.
+    """
+
+    def names(fn):
+        return list(inspect.signature(fn).parameters)
+
+    # Replaced while Fire runs.
+    assert names(fire.core._GetMember) == ["component", "args"]
+    assert names(fire.core._CallAndUpdateTrace)[:3] == ["component", "args", "component_trace"]
+    assert names(fire.core._Fire)[:2] == ["component", "args"]
+    assert names(fire.trace.FireTrace.AddAccessedProperty)[:4] == ["self", "component", "target", "args"]
+    assert len(names(fire.decorators.GetMetadata)) == 1
+    assert names(fire.core.Display) == ["lines", "out"]
+    for fn in (fire.core.helptext.HelpText, fire.core.helptext.UsageText):
+        assert names(fn) == ["component", "trace", "verbose"]
+    assert callable(fire.formatting.Bold) and callable(fire.formatting.Underline)
+    # Read from Fire.
+    assert "include_separators" in names(fire.trace.FireTrace.GetCommand)
+    assert callable(fire.trace.FireTrace.GetLastHealthyElement) and callable(fire.trace.FireTrace.HasError)
+    assert callable(fire.trace.FireTraceElement.HasCapacity)
+    assert all(isinstance(getattr(fire.trace, name), str)
+               for name in ("INITIAL_COMPONENT", "INSTANTIATED_CLASS", "ACCESSED_PROPERTY"))
+    assert isinstance(fire.decorators.FIRE_PARSE_FNS, str) and isinstance(fire.decorators.FIRE_METADATA, str)
+    assert callable(fire.parser.DefaultParseValue)
+    assert issubclass(fire.core.FireExit, SystemExit) and len(names(fire.core.FireExit.__init__)) == 3  # code, trace
+    # Noted in a trace by fireaid: the element's action and component, and the separator.
+    trace = fire.trace.FireTrace(initial_component=None)
+    element = trace.elements[-1]
+    assert element._action == fire.trace.INITIAL_COMPONENT and hasattr(element, "component")
+    assert hasattr(trace, "separator") and hasattr(trace, "show_help")

@@ -42,6 +42,7 @@ test = [
     "colorama",  # what Fire strips colour with on Windows, to test against anywhere
     "pytest",
     "rich",  # for examples/progress.py
+    "ruff",
 ]
 
 [project.urls]
@@ -58,3 +59,21 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:fire",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# Errors, warnings, bugbear, unused arguments and imports, outdated syntax, import order.
+select = ["E", "F", "W", "B", "ARG", "UP", "I"]
+# The tests spell Optional[T] and quote a hint on purpose: what fireaid reads is the point.
+ignore = ["UP037", "UP045"]
+
+[tool.ruff.lint.per-file-ignores]
+# Signal handlers and stand-ins take arguments they do not use.
+"tests/*" = ["ARG"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fireaid"]
+known-local-folder = ["support"]

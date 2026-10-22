@@ -166,7 +166,8 @@ TD = datetime.timedelta
         (D, "2026-10-15", D(2026, 10, 15)),
         (DT, "2026-10-15", DT(2026, 10, 15)),
         (DT, "2026-10-15T12:30", DT(2026, 10, 15, 12, 30)),
-        (DT, "2026-10-15 12:30:15+02:00", DT(2026, 10, 15, 12, 30, 15, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))),
+        (DT, "2026-10-15 12:30:15+02:00",
+         DT(2026, 10, 15, 12, 30, 15, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))),
         (T, "12:30", T(12, 30)),
         (T, "12:30:15.500000", T(12, 30, 15, 500000)),
         # Durations: seconds, units, or the clock form str() prints.

@@ -23,6 +23,7 @@ import pytest
 
 import fireaid
 from fireaid import remote
+
 from support import TESTS, unix
 from support import environment as program_environment
 from support import on_terminal as run_on_terminal
@@ -177,7 +178,8 @@ class Said:
     @staticmethod
     def refused(err):
         """The server refused the command line, and the client named the server."""
-        return re.fullmatch(r"cli\.py: 127\.0\.0\.1:\d+: [^\n]*(is|are) not available remotely[^\n]*\n", err) is not None
+        return re.fullmatch(r"cli\.py: 127\.0\.0\.1:\d+: [^\n]*(is|are) not available remotely[^\n]*\n",
+                            err) is not None
 
     @staticmethod
     def refused_after_separator(err):
@@ -355,23 +357,24 @@ def test_bad_target(text):
 )
 def test_flag_anywhere_before_separator(command, rest, monkeypatch):
     monkeypatch.delenv("T_REMOTE", raising=False)
-    target, words = remote.take_flag(command.split(), "t", 4247, "T_REMOTE")
+    target, words = remote.take_flag(command.split(), 4247, "T_REMOTE")
     assert words == rest.split()
     assert (target is not None) == (command != "get x -- --remote h")
 
 
 def test_flag_from_environment(monkeypatch):
     monkeypatch.setenv("T_REMOTE", "env")
-    assert remote.take_flag(["get"], "t", 1, "T_REMOTE")[0].host == "env"
-    assert remote.take_flag(["get", "--remote", "flag"], "t", 1, "T_REMOTE")[0].host == "flag"
-    assert remote.take_flag(["get", "--remote="], "t", 1, "T_REMOTE")[0] is None
-    assert remote.take_flag(["server"], "t", 1, "T_REMOTE")[0] is None
+    assert remote.take_flag(["get"], 1, "T_REMOTE")[0].host == "env"
+    assert remote.take_flag(["get", "--remote", "flag"], 1, "T_REMOTE")[0].host == "flag"
+    assert remote.take_flag(["get", "--remote="], 1, "T_REMOTE")[0] is None
+    assert remote.take_flag(["server"], 1, "T_REMOTE")[0] is None
 
 
-@pytest.mark.parametrize("command", ["--remote a get --remote b", "get --remote", "get --remote -- x", "get --remote=h:x"])
+@pytest.mark.parametrize("command",
+                         ["--remote a get --remote b", "get --remote", "get --remote -- x", "get --remote=h:x"])
 def test_bad_flag(command):
     with pytest.raises(remote.RemoteError) as e:
-        remote.take_flag(command.split(), "t", 1, "T_REMOTE")
+        remote.take_flag(command.split(), 1, "T_REMOTE")
     assert e.value.code == 2
 
 
@@ -868,7 +871,8 @@ def test_help_lists_the_remote_flag(component, command):
     assert "CLI_REMOTE" in flags and "cli.py help server" in flags
 
 
-@pytest.mark.parametrize("command", [["help", "server"], ["help", "static"], ["help", "static", "bar"], ["help", "help"]])
+@pytest.mark.parametrize("command",
+                         [["help", "server"], ["help", "static"], ["help", "static", "bar"], ["help", "help"]])
 def test_no_remote_flag_where_it_does_not_run_remotely(command):
     code, out, err = run(command, "INSTANCE")
     assert code == 0 and REMOTE_FLAG not in out
@@ -1597,7 +1601,7 @@ def test_terminal_is_restored_whatever_goes_wrong(monkeypatch):
         def fail(*args):
             raise RuntimeError("on the way")
 
-        monkeypatch.setattr(remote._Client, "handshake", lambda self, argv: None)
+        monkeypatch.setattr(remote._Client, "handshake", lambda self: None)
         monkeypatch.setattr(remote, "_same_file", fail)
         with pytest.raises(RuntimeError):
             remote._Client(ours, remote.Target("h", 1, None)).run(["tty"])
@@ -1796,7 +1800,8 @@ def test_windows_like_client_on_a_terminal(server):
     target = server("Probe").target
     like = {"FIREAID_REMOTE_TEST_NO_PTY": "1"}
     assert on_terminal(["tty", "--remote", target], **like) == (0, "111 80x24\n", "")
-    assert on_terminal(["color", "--remote", target], stdout_tty=False, **like) == (0, "\x1b[31mred\x1b[0m\n", "result\n")
+    assert on_terminal(["color", "--remote", target], stdout_tty=False, **like) == (
+        0, "\x1b[31mred\x1b[0m\n", "result\n")
 
 
 @unix

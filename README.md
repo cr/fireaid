@@ -354,6 +354,11 @@ runs the tests against the oldest Fire that `pyproject.toml` allows, in
 default, another with `PYTHON_MIN=python3.11`. `make clean` removes both
 environments.
 
+    make lint
+
+runs [ruff](https://docs.astral.sh/ruff/) over the code, as the test
+workflow does before the tests.
+
 ## Releasing
 
 Set the new `version` in `pyproject.toml`, commit, then tag and push:

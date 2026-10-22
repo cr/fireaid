@@ -3,6 +3,12 @@
 
 version: 2
 updates:
+  # The project's dependencies. A range such as fire>=0.2.0 is left as it
+  # is; a new Fire is tested by the weekly run of the test workflow.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:

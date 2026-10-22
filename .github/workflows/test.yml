@@ -2,8 +2,9 @@
 # Windows, each on the oldest Python fireaid supports and the latest
 # stable one, with the latest stable Fire; and on Linux with the oldest
 # Python and the oldest Fire. Terminal tests skip on Windows, which has
-# no pseudo-terminals. The publish workflow runs the same before a
-# release.
+# no pseudo-terminals. ruff checks the code first. A weekly run catches a
+# new Fire, since the tests install the latest. The publish workflow runs
+# the same before a release.
 
 name: Test
 
@@ -13,11 +14,24 @@ on:
     tags-ignore: ["v*"]  # the publish workflow tests a release itself
   pull_request:
   workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: python -m pip install --quiet ruff
+      - run: ruff check
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20  # the suite takes two; a hung test is cut short

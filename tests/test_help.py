@@ -220,7 +220,8 @@ def test_help_for_a_class_with_flags(run):
     result = run("help", component="Configured")
     assert result.code == 0 and result.err == ""
     out = result.out
-    assert "\nSYNOPSIS\n    cli.py <flags> GROUP | COMMAND | VALUE\n\nDESCRIPTION\n    Configured doc.\n\nFLAGS\n" in out
+    assert ("\nSYNOPSIS\n    cli.py <flags> GROUP | COMMAND | VALUE\n\nDESCRIPTION\n    Configured doc.\n\nFLAGS\n"
+            in out)
     assert re.search(r"\n    (-v, )?--verbose=VERBOSE\n", out)  # the short flag from Fire 0.5.0 on
     assert out.index("FLAGS\n") < out.index("GROUPS\n") < out.index("COMMANDS\n") < out.index("VALUES\n")
     assert "     dynamic\n" in out and "     foo\n" in out and "     verbose\n" in out

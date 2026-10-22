@@ -185,7 +185,7 @@ def parse_target(text: str, default_port: int) -> Target:
     return Target(host, int(port_text), password)
 
 
-def take_flag(command: Sequence[str], prog: str, default_port: int, variable: str) -> tuple[Target | None, list[str]]:
+def take_flag(command: Sequence[str], default_port: int, variable: str) -> tuple[Target | None, list[str]]:
     """
     Take ``--remote`` out of a command line.
 
@@ -571,7 +571,7 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
         listener.close()
         raise RemoteError(f"cannot listen on {bind}:{port}: {e.strerror or e}") from None
 
-    def stop(sig, frame):
+    def stop(_sig, _frame):
         raise SystemExit(0)
 
     handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, _SIGNALS.get("HUP")) if sig}
@@ -1371,7 +1371,7 @@ class _Client:
 
     def run(self, argv: list[str]) -> int:
         try:
-            self.handshake(argv)
+            self.handshake()
         except socket.timeout:
             raise RemoteError(f"{self.target} does not answer") from None
         except (_ProtocolError, OSError, EOFError) as e:
@@ -1382,10 +1382,10 @@ class _Client:
         saved = None
         handlers = {}
 
-        def note(sig, frame):
+        def note(sig, _frame):
             self.signals.append(sig)
 
-        def leave(sig, frame):
+        def leave(sig, _frame):
             raise SystemExit(128 + sig)
 
         try:
@@ -1435,7 +1435,7 @@ class _Client:
             return None
         return {"cols": columns, "rows": lines}
 
-    def handshake(self, argv: list[str]) -> None:
+    def handshake(self) -> None:
         channel = self.channel
         kind, payload = channel.read()
         if kind == REFUSED:  # the server turned us away before the challenge

@@ -147,12 +147,10 @@ def _parser_for(hint: Any) -> Any:
     elif issubclass(hint, datetime.time):
         parse, form = hint.fromisoformat, "a time, HH:MM[:SS]"
     else:
-        for cls, form in _CONSTRUCTED:
-            if issubclass(hint, cls):
-                parse = hint
-                break
-        else:
+        form = next((form for cls, form in _CONSTRUCTED if issubclass(hint, cls)), None)
+        if form is None:
             return None
+        parse = hint
     return parse, form, optional
 
 
@@ -188,7 +186,7 @@ def _parsers(component: Any) -> tuple[dict[str, Any], Any]:
     if inspect.isclass(component):
         fn = component.__init__
     elif not inspect.isroutine(component):
-        fn = getattr(component, "__call__", None)
+        fn = component.__call__ if callable(component) else None
     try:
         annotations = dict(getattr(fn, "__annotations__", None) or {})
         namespace = dict(getattr(fn, "__globals__", None) or {})

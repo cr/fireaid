@@ -241,7 +241,7 @@ def _add_help(component: Any, name: Any = None) -> tuple[Any, Any]:
 def _as_method(function: Any) -> Any:
     """The function as a method that ignores its instance, and looks to Fire like the function."""
 
-    def method(self, *args, **kwargs):
+    def method(self, *args, **kwargs):  # noqa: ARG001 - the instance is what Fire calls it on
         return function(*args, **kwargs)
 
     signature = inspect.signature(function)
@@ -520,7 +520,7 @@ def _unstripped(stream: Any) -> Any:
     return stream
 
 
-def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
+def _display_stdout(lines: Sequence[str], out: Any = None) -> None:  # noqa: ARG001 - Display's signature
     """
     Stand in for fire.core.Display, printing to stdout instead of stderr,
     and not through a pager.
@@ -749,7 +749,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
         if _member(component, "server")[0]:
             raise ValueError("remote=True needs the name 'server'; the program already has it")
         try:
-            target, command = module.take_flag(command, prog, remote.port, variable)
+            target, command = module.take_flag(command, remote.port, variable)
             if target is not None:
                 code = module.run_client(target, command)
                 if code:

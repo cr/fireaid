@@ -5,12 +5,15 @@ VENV := .venv
 VENV_MIN := .venv-min
 FIRE_MIN := $(shell sed -n 's/^ *"fire>=\([0-9.]*\)",*$$/\1/p' pyproject.toml)
 
-.PHONY: test test-min clean
+.PHONY: test test-min lint clean
 
 # Tests run against the latest stable Fire, whatever was installed before.
 test: $(VENV)
 	$(VENV)/bin/pip install --quiet --upgrade fire
 	$(VENV)/bin/pytest
+
+lint: $(VENV)
+	$(VENV)/bin/ruff check
 
 # And against the oldest Fire that pyproject.toml allows.
 test-min: $(VENV_MIN)

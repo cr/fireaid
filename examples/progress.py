@@ -107,8 +107,14 @@ def show_progress(description: str, unit: str):
         yield log_progress(unit)
         return
 
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn, \
-        TimeRemainingColumn
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        TaskProgressColumn,
+        TextColumn,
+        TimeRemainingColumn,
+    )
 
     columns = (TextColumn("{task.description}"), BarColumn(), TaskProgressColumn(), MofNCompleteColumn(),
                TextColumn(unit), TimeRemainingColumn())
