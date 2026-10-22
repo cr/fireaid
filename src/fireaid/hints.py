@@ -23,7 +23,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Any
 
-from fire import core, decorators
+from fire import core, decorators, parser
 
 _OPTIONAL = re.compile(r"(?:typing\.)?Optional\[(.*)\]")
 _WORDS = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
@@ -170,8 +170,18 @@ def _parse_function(name: str, parse: Any, form: str, optional: bool) -> Any:
     return parse_value
 
 
-def _parsers(component: Any) -> dict[str, Any]:
-    """Parse functions for the hinted parameters of what Fire is about to call."""
+def _parsers(component: Any) -> tuple[dict[str, Any], Any]:
+    """
+    Parse functions for the hinted parameters of what Fire is about to
+    call: by name, and the one for the values of ``*args`` and the flags
+    of ``**kwargs``, or None.
+
+    Fire reads those with its default parse function, which is also
+    what any other parameter without a parse function of its own falls
+    back to. Where there is one for them, every other parameter gets
+    one, Fire's own where fireaid does not read its hint. Where
+    ``*args`` and ``**kwargs`` have different hints, both are Fire's.
+    """
     fn = component
     if inspect.isclass(component):
         fn = component.__init__
@@ -180,21 +190,35 @@ def _parsers(component: Any) -> dict[str, Any]:
     try:
         annotations = dict(getattr(fn, "__annotations__", None) or {})
         namespace = dict(getattr(fn, "__globals__", None) or {})
+        parameters = list(inspect.signature(fn).parameters.values())
     except Exception:  # a program may hide anything behind __getattr__
-        return {}
-    parsers = {}
-    for name, hint in annotations.items():
-        if name == "return":
+        return {}, None
+    variadic = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    named = {}
+    rest = []  # (hint, parse function) of *args and **kwargs
+    for parameter in parameters:
+        if parameter.name not in annotations:
             continue
+        hint = annotations[parameter.name]
         if isinstance(hint, str):
             try:
                 hint = eval(hint, namespace)  # as typing.get_type_hints reads it
             except Exception:  # then only its words are known
                 pass
         found = _parser_for(hint)
-        if found is not None:
-            parsers[name] = _parse_function(name, *found)
-    return parsers
+        if found is None:
+            continue
+        parse = _parse_function(parameter.name, *found)
+        if parameter.kind in variadic:
+            rest.append((hint, parse))
+        else:
+            named[parameter.name] = parse
+    if not rest or any(hint != rest[0][0] for hint, _ in rest):
+        return named, None
+    for parameter in parameters:
+        if parameter.kind not in variadic:
+            named.setdefault(parameter.name, parser.DefaultParseValue)
+    return named, rest[0][1]
 
 
 @contextmanager
@@ -204,9 +228,10 @@ def typed_parsing() -> Any:
 
     Fire reads a function's parse functions from its metadata when it
     calls it. For the duration of the call, the metadata gains a parse
-    function for each parameter whose hint fireaid reads. A parse
-    function the program sets for a parameter with fire.decorators wins,
-    and a default one leaves all parameters to the program.
+    function for each parameter whose hint fireaid reads, and a default
+    one for ``*args`` and ``**kwargs``. A parse function the program sets
+    for a parameter with fire.decorators wins, and a default one leaves
+    all parameters to the program.
     """
     original = decorators.GetMetadata
     key = decorators.FIRE_PARSE_FNS
@@ -216,11 +241,11 @@ def typed_parsing() -> Any:
         parse_fns = metadata.get(key) or {"default": None, "positional": [], "named": {}}
         if parse_fns.get("default") is not None:
             return metadata
-        named = _parsers(component)
-        if not named:
+        named, rest = _parsers(component)
+        if not named and rest is None:
             return metadata
         named.update(parse_fns["named"])
-        return {**metadata, key: {**parse_fns, "named": named}}
+        return {**metadata, key: {**parse_fns, "named": named, "default": rest}}
 
     decorators.GetMetadata = GetMetadata
     try:

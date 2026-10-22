@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -181,8 +182,22 @@ class Said:
         return err == f"cli.py: 127.0.0.1:{port}: authentication failed\n"
 
     @staticmethod
-    def password_unused(err, target):
-        return err == f"warning: {target} asks for no password; the one given is not used\n"
+    def not_sent_without_password(err, target):
+        """The client has a password, the server asks for none: the command does not go."""
+        return err == f"cli.py: {target} asks for no password, so the command is not sent to it\n"
+
+    @staticmethod
+    def not_sent_to_impostor(err, target):
+        return err == f"cli.py: {target} does not know the password, so the command is not sent to it\n"
+
+    @staticmethod
+    def busy(err):
+        return re.fullmatch(r"cli\.py: 127\.0\.0\.1:\d+: busy with another client's command; try again later\n",
+                            err) is not None
+
+    @staticmethod
+    def disconnected(output, target):
+        return f"cli.py: disconnected from {target}\n" in output
 
     @staticmethod
     def unreachable(err, target):
@@ -211,7 +226,7 @@ class Said:
 
 
 class Server:
-    def __init__(self, component, password, log, pipes=False, debug=False):
+    def __init__(self, component, password, log, pipes=False, debug=False, **variables):
         # Loopback, so that no firewall asks about the tests.
         # The password is True for the usual one, or a string of its own.
         secret = password if isinstance(password, str) else PASSWORD
@@ -223,7 +238,7 @@ class Server:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=log.open("w"),
-            env=environment(component, FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else ""),
+            env=environment(component, FIREAID_REMOTE_TEST_NO_PTY="1" if pipes else "", **variables),
             cwd=TESTS,
         )
         deadline = time.monotonic() + 10
@@ -629,14 +644,91 @@ def test_password_without_a_value_is_refused():
         assert process.stderr.startswith("SETUP debug=False\n") and Said.needs_value(process.stderr, "--password")
 
 
-def test_password_given_to_a_server_without_one_is_warned_about(server):
+def test_password_given_to_a_server_without_one_is_refused(server):
+    """A server that asks for no password may not be the one meant: the command does not go to it."""
     s = server()
     assert s.log.without_password()
     assert s.log.warned_no_password()
     assert not s.log.warned_open_network()  # it listens on loopback
-    code, out, err = run(["foo", "x", "--remote", f"pw@{s.target}"])
-    assert (code, out) == (0, "foo name='x' count=1\n")
-    assert Said.password_unused(err, s.target)
+    before = s.log.text
+    for password in ("pw", ""):
+        code, out, err = run(["foo", "x", "--remote", f"{password}@{s.target}"])
+        assert (code, out) == (1, "")
+        assert Said.not_sent_without_password(err, s.target)
+    assert not Log.ran(s.log.text[len(before):], "foo x")
+
+
+def test_server_that_does_not_know_the_password_gets_no_command():
+    """The server proves it knows the password too: an impostor learns no command line."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    got = []
+
+    def impostor():
+        sock, _ = listener.accept()
+        channel = remote._Channel(sock)
+        channel.write(remote.CHALLENGE, {"proto": remote.PROTOCOL, "nonce": "ab" * 32, "auth": True, "pty": False})
+        got.append(channel.read())  # HELLO
+        got.append(channel.read())  # AUTH
+        channel.write(remote.AUTH_OK, {"mac": "0" * 64})
+        sock.settimeout(10)
+        try:
+            got.append(channel.read())
+        except EOFError:
+            pass
+        sock.close()
+
+    thread = threading.Thread(target=impostor)
+    thread.start()
+    code, out, err = run(["foo", "x", "--count", "s3cret", "--remote", f"pw@127.0.0.1:{port}"])
+    thread.join(10)
+    listener.close()
+    assert (code, out) == (1, "")
+    assert Said.not_sent_to_impostor(err, f"127.0.0.1:{port}")
+    assert [kind for kind, _ in got] == [remote.HELLO, remote.AUTH]  # and no RUN
+
+
+def log_in(port, password=None, mac=None):
+    """Log in to a server by hand. Returns the channel, and what the server answered."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    channel = remote._Channel(sock)
+    challenge = remote._json(channel.expect(remote.CHALLENGE))
+    channel.write(remote.HELLO, {"proto": remote.PROTOCOL})
+    if challenge["auth"]:
+        ours = os.urandom(32)
+        if mac is None:
+            mac = remote._mac(password, "client", bytes.fromhex(challenge["nonce"]), ours)
+        channel.write(remote.AUTH, {"mac": mac, "nonce": ours.hex()})
+    return channel, channel.read()
+
+
+def test_any_mac_is_refused_as_such(server):
+    """A MAC that is not even ASCII fails authentication like any other wrong one."""
+    s = server(password=True)
+    before = s.log.text
+    channel, (kind, payload) = log_in(s.port, mac="é" * 64)
+    channel.sock.close()
+    assert kind == remote.REFUSED and remote._json(payload)["message"] == "authentication failed"
+    assert "error" not in s.log.text[len(before):]
+
+
+def test_server_takes_no_more_input_than_it_asked_for(server):
+    """A client that sends input the server has not asked for is cut off."""
+    s = server("Probe")
+    channel, (kind, _) = log_in(s.port)
+    assert kind == remote.AUTH_OK
+    channel.write(remote.RUN, {"argv": ["sleep", "--seconds", "20"], "tty": [False, False, False], "env": {}})
+    chunk = b"x" * (remote._MAX_FRAME // 2)
+    try:
+        for _ in range(4):  # twice what it asks for
+            channel.write(remote.STDIN, chunk)
+        channel.sock.settimeout(10)
+        while channel.read():
+            pass
+    except (EOFError, OSError):
+        pass
+    channel.sock.close()
+    assert s.log.wait(lambda text: "went away" in text) and "went away" in s.log.text
 
 
 def test_unreachable():
@@ -653,6 +745,9 @@ def test_connect_retries_transient_errors_and_names_each_address(monkeypatch):
             self.family = family
 
         def settimeout(self, t):
+            pass
+
+        def setsockopt(self, *option):
             pass
 
         def connect(self, address):
@@ -709,6 +804,165 @@ def test_instant_no_route_everywhere_names_the_macos_permission(monkeypatch):
     with pytest.raises(remote.RemoteError) as e:
         remote.connect(remote.Target("r5", 4247, None), timeout=0.6)
     assert "Local Network" not in str(e.value)
+
+
+@unix  # ps tells the server's memory
+@pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
+def test_input_waits_for_the_command(server, pipes):
+    """Input the command does not read waits at the client, not in the server's memory."""
+    s = server("Probe", pipes=pipes)
+
+    def memory():
+        return int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(s.process.pid)])) // 1024
+
+    before = memory()
+    client = subprocess.Popen(
+        [sys.executable, "cli.py", "sleep", "--seconds", "20", "--remote", s.target],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment("Probe"),
+        cwd=TESTS,
+    )
+    sent = []
+
+    def feed():
+        try:
+            for _ in range(200):
+                client.stdin.write(b"x" * (1 << 20))
+                sent.append(1)
+        except (BrokenPipeError, ValueError):
+            pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    time.sleep(3)
+    grown = memory() - before
+    client.kill()
+    client.wait()
+    assert len(sent) < 50, "the client's stdin backs up"
+    assert grown < 32, f"the server grew by {grown} MiB"
+
+
+def test_pipes_only_command_lets_go_of_its_threads():
+    """A client gone while the command's output is backed up leaves no thread behind."""
+    ours, theirs = socket.socketpair()
+    ours.setblocking(False)
+    code = "import sys\nwhile True: sys.stdout.buffer.write(b'x' * 65536)"
+    launch = remote.Launch((sys.executable, "-c", code), str(TESTS))
+    request = {"argv": [], "tty": [False, False, False], "env": {}}
+    before = threading.active_count()
+    command = remote._PipeCommand(remote._Channel(ours), launch, request, ())
+    result = []
+    runner = threading.Thread(target=lambda: result.append(command.run()))
+    runner.start()
+    time.sleep(2)  # nobody reads: the output backs up into the queue
+    theirs.close()
+    runner.join(15)
+    ours.close()
+    deadline = time.monotonic() + 5
+    while threading.active_count() > before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert result == [None]
+    assert threading.active_count() == before
+
+
+def test_interrupt_without_sigwinch(monkeypatch):
+    """Windows has no SIGWINCH: Ctrl-C at a client there is passed on all the same."""
+    monkeypatch.delattr(signal, "SIGWINCH", raising=False)
+    ours, theirs = socket.socketpair()
+    client = remote._Client(ours, remote.Target("h", 1, None))
+    client.signals.append(signal.SIGINT)
+    client.handle_signals()
+    ours.close()
+    theirs.close()
+    assert list(remote._parse(bytearray(client.channel.outgoing))) == [(remote.SIGNAL, b'{"name": "INT"}')]
+
+
+def test_connection_has_the_handshake_time_and_keepalive():
+    """However long connecting took, the handshake gets its own time; a vanished peer is noticed."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    try:
+        sock = remote.connect(remote.Target("127.0.0.1", listener.getsockname()[1], None), timeout=0.5)
+        assert sock.gettimeout() == remote._HANDSHAKE_TIMEOUT
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        sock.close()
+    finally:
+        listener.close()
+
+
+def test_a_lost_connection_is_a_peer_gone():
+    """What keepalive reports, a timed-out connection, ends the relay as a closed one does."""
+
+    class Lost:
+        def recv(self, size):
+            raise TimeoutError(errno.ETIMEDOUT, "Operation timed out")
+
+        send = recv
+
+    channel = remote._Channel(Lost())
+    with pytest.raises(EOFError):
+        channel.receive()
+    channel.outgoing += b"x"
+    with pytest.raises(EOFError):
+        channel.flush()
+
+
+def test_busy_server_says_so(server):
+    """While one client's command runs, another is told so at once."""
+    target = server("Probe").target
+    first = subprocess.Popen(
+        [sys.executable, "cli.py", "sleep", "--remote", target],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=environment("Probe"), cwd=TESTS,
+    )
+    try:
+        assert first.stdout.readline().rstrip(b"\r\n") == b"started"
+        started = time.monotonic()
+        code, out, err = run(["tty", "--remote", target], "Probe")
+        assert time.monotonic() - started < 3
+        assert (code, out) == (1, "") and Said.busy(err)
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_clients_slow_to_log_in_keep_no_one_out(server):
+    """Connections that never log in do not hold up one that does."""
+    s = server(password=True)
+    idle = [socket.create_connection(("127.0.0.1", s.port)) for _ in range(3)]
+    try:
+        started = time.monotonic()
+        assert run(["foo", "x", "--remote", s.target])[:2] == (0, "foo name='x' count=1\n")
+        assert time.monotonic() - started < 5
+    finally:
+        for sock in idle:
+            sock.close()
+
+
+def test_server_password_from_the_environment(tmp_path):
+    """CLI_SERVER_PASSWORD keeps the password off the command line; commands do not get it."""
+    s = Server("Probe", False, tmp_path / "log", CLI_SERVER_PASSWORD=PASSWORD)
+    try:
+        assert not s.log.without_password()
+        target = f"{PASSWORD}@127.0.0.1:{s.port}"
+        assert run(["env", "CLI_SERVER_PASSWORD", "--remote", target], "Probe", input=b"")[:2] == (
+            0, "CLI_SERVER_PASSWORD=-\n")
+        code, out, err = run(["foo", "x", "--remote", f"wrong@127.0.0.1:{s.port}"], "Probe")
+        assert (code, out) == (1, "") and Said.authentication_failed(err, s.port)
+    finally:
+        s.stop()
+
+
+def test_server_logs_through_its_own_logger_only(monkeypatch):
+    """Without the program's own logging, --debug shows the server's lines, not every library's."""
+    import logging
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(remote.logger, "handlers", [])
+    monkeypatch.setattr(remote.logger, "level", logging.NOTSET)
+    monkeypatch.setattr(remote.logger, "propagate", True)
+    level = root.level
+    remote._plain_logging("t", debug=True)
+    assert root.handlers == [] and root.level == level
+    assert len(remote.logger.handlers) == 1 and remote.logger.level == logging.DEBUG
+    assert not remote.logger.propagate
 
 
 @pytest.mark.parametrize("pipes", [False, True])
@@ -846,6 +1100,15 @@ def test_terminal_for_stderr_and_a_pipe_for_stdout(server):
     assert local == (0, "\x1b[31mred\x1b[0m\n", "result\n")
     assert on_terminal(["color", "--remote", target], stdout_tty=False) == local
     assert on_terminal(["tty", "--remote", target], stdout_tty=False) == (0, "", "101 80x24\n")
+
+
+@unix
+def test_escape_from_a_raw_terminal(server):
+    """With the client's terminal raw, Ctrl-C is a key for the server's; Enter ~ . disconnects."""
+    target = server("Probe").target
+    code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\r~.", wait_for=b"started")
+    assert code == 255
+    assert Said.disconnected(output, target)
 
 
 @unix

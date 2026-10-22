@@ -92,6 +92,9 @@ The hints fireaid reads:
   else is read as `T`. A `NewType` and a subclass of any of the above
   are read as the type they are made of.
 
+The hint of `*args` is read for each of its values, and the hint of
+`**kwargs` for each flag it takes, unless the two differ.
+
 Other hints, and parameters without one, are left to Fire, and so is
 a parameter whose parse function the program sets with
 `fire.decorators.SetParseFn` or `SetParseFns`.
@@ -186,6 +189,10 @@ adds a `server` command, which serves the program's commands:
     tool server --port 4247 --password secret
     tool server --bind 127.0.0.1
 
+The variable `TOOL_SERVER_PASSWORD` gives the password where `--password`
+does not, keeping it out of the server's process list; the commands the
+server runs do not get it.
+
 and a `--remote [PASSWORD@]HOST[:PORT]` flag, which runs a command line
 on such a server, anywhere on the command line before a `--`:
 
@@ -205,6 +212,13 @@ colour, progress bars, line width, prompts and Ctrl-C work as they do
 locally; where the client has a pipe or a file, the command gets a pipe.
 The client's `TERM`, `NO_COLOR`, `FORCE_COLOR`, `COLUMNS` and locale
 settings go along, not its `PAGER`, which Fire runs in a shell.
+Input goes to the server as the command reads it, so that a command
+that reads slowly, or not at all, keeps it waiting at the client.
+
+Where the client's terminal passes keys straight on, Ctrl-C is a key
+for the command's terminal on the server. To leave a command that does
+not end, type Enter, `~` and `.`, as in ssh: the client disconnects
+with exit code 255, and the server ends the command.
 
 Commands that must only run locally are named in a `fireaid.Remote`:
 
@@ -228,13 +242,19 @@ The server listens on all of the computer's addresses unless `--bind`
 names one. Without a password, anyone who can reach the port may run the
 program's commands, which is the normal state of affairs on a network of
 one's own; the server says so once when it starts. With a password,
-clients must know it: the server authenticates them by HMAC
-challenge-response, so the password never crosses the network, and a
-recorded login does not work a second time. That is mild security. The
-connection is not encrypted or protected otherwise, so whoever can
-watch it can read the commands and their output, take over a session
-once it has started, and try passwords against a recorded login. The
-server serves one client at a time.
+client and server prove to each other that they know it, by HMAC
+challenge-response: the password never crosses the network, a recorded
+login does not work a second time, and a client sends its command only
+to a server that knows the password, never to one that asks for none.
+That is mild security. The connection is not encrypted or protected
+otherwise, so whoever can watch it can read the commands and their
+output, take over a session once it has started, and try passwords
+against a recorded login.
+
+The server runs one command at a time. A client that logs in meanwhile
+is told the server is busy, and clients slow to log in keep no other
+out. Server and client notice within a minute or so when the other has
+vanished without a word, as a computer gone to sleep does.
 
 A server on Windows, which has no pseudo-terminals, gives every command
 pipes: the command behaves as if its output were redirected, and Ctrl-C

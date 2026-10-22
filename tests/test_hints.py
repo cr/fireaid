@@ -281,6 +281,45 @@ def test_other_hints_are_fires(hint, text, expected):
     assert fireaid.Fire(fn, command=["--value", text]) == expected
 
 
+def test_variadic_parameters():
+    def words(*words: str):
+        return words
+
+    def flags(**flags: datetime.date):
+        return flags
+
+    def both(first, *rest: str, **flags: str):
+        return first, rest, flags
+
+    # Fire would make these 5, 1000.0 and the string '2026-10-15'.
+    assert fireaid.Fire(words, command=["5", "1e3"]) == ("5", "1e3")
+    assert fireaid.Fire(flags, command=["--on", "2026-10-15"]) == {"on": datetime.date(2026, 10, 15)}
+    # A parameter without a hint stays Fire's.
+    assert fireaid.Fire(both, command=["1e3", "5", "--b", "7"]) == (1000.0, ("5",), {"b": "7"})
+
+
+@pytest.mark.parametrize("fn", ["words", "flags"])
+def test_variadic_parameter_rejects(fn, capsys):
+    def words(*words: int):
+        return words
+
+    def flags(**flags: int):
+        return flags
+
+    command = {"words": ["1e3"], "flags": ["--a", "1e3"]}[fn]
+    with pytest.raises(fire.core.FireExit) as e:
+        fireaid.Fire(locals()[fn], command=command)
+    assert e.value.code == 2
+    assert fireaid._ANSI.sub("", capsys.readouterr().err).startswith(f"ERROR: {fn}: '1e3' is not an integer\n")
+
+
+def test_variadic_parameters_with_different_hints_are_fires():
+    def both(*rest: int, **flags: float):
+        return rest, flags
+
+    assert fireaid.Fire(both, command=["1e3", "--a", "5"]) == ((1000.0,), {"a": 5})
+
+
 def test_bare_parameters_are_fires():
     def fn(value=None, *rest):
         return value, rest

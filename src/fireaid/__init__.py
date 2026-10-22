@@ -320,6 +320,7 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
             print(f"{prog}: {e}", file=sys.stderr)
             raise SystemExit(e.code) from None
 
+    secret = _remote_module().password_variable(prog)
     local = ""
     if remote.deny:
         names = ", ".join(remote.deny)
@@ -331,17 +332,20 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> An
         --remote= runs the command locally. Without a password, anyone who
         can reach the port may run commands; with one, clients are
         authenticated by HMAC challenge-response. The connection is not
-        encrypted either way.
+        encrypted either way. {secret} gives the password where
+        --password does not, out of sight of other users.
 
         Each command runs in a new process of this program, as if typed
         here. Its output, input and exit code are relayed, and it sees a
         terminal where the client has one: colour, progress bars, the
         terminal width, prompts and Ctrl-C work as they do locally.
-        One client is served at a time.{local}
+        One command runs at a time; a client that comes meanwhile is told
+        the server is busy. Where Ctrl-C is a key for the server's terminal,
+        Enter ~ . disconnects.{local}
 
         Args:
             port: The TCP port to listen on, 0 for any free one.
-            password: The password clients must give; none by default.
+            password: The password clients must give; none by default, or {secret}.
             bind: The address to listen on: all of this computer's by default,
                 127.0.0.1 for clients on this computer only.
             debug: Log each client, its command line and how it ended.
