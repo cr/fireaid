@@ -880,15 +880,24 @@ def _send_exit(channel: _Channel, returncode: int) -> int:
     return code
 
 
-def _take_terminal() -> None:
-    """In the child: make the terminal among its stdio the controlling one."""
-    for fd in (0, 1, 2):
-        if os.isatty(fd):
-            try:
-                fcntl.ioctl(fd, termios.TIOCSCTTY, 0)
-            except OSError:
-                pass
-            return
+# What a command with a terminal starts through: a bare interpreter that
+# makes the terminal among its stdio the controlling one, then becomes
+# the program. The server has threads, its logins, and what runs in a
+# forked child before it execs can deadlock on a lock one of them held:
+# Python says so of preexec_fn. This way nothing of the server's runs
+# there, at the cost of an interpreter start of some 20 ms.
+_TAKE_TERMINAL = (
+    sys.executable, "-I", "-S", "-c",
+    "import fcntl, os, sys, termios\n"
+    "for fd in (0, 1, 2):\n"
+    "    if os.isatty(fd):\n"
+    "        try:\n"
+    "            fcntl.ioctl(fd, termios.TIOCSCTTY, 0)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        break\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])",
+)
 
 
 class _Command:
@@ -930,9 +939,10 @@ class _Command:
             self.release()
         return _send_exit(self.channel, self.process.wait())
 
-    def popen(self, **options: Any) -> None:
+    def popen(self, through: Sequence[str] = (), **options: Any) -> None:
+        """Start the command, through a bootstrap that execs it if given."""
         self.process = subprocess.Popen(
-            [*self.launch.prefix, *self.request["argv"]],
+            [*through, *self.launch.prefix, *self.request["argv"]],
             cwd=self.launch.cwd,
             env=_environment(self.request, self.hidden),
             **options,
@@ -1023,16 +1033,12 @@ class _PtyCommand(_Command):
             self.outputs[r] = STDERR
 
         try:
-            # Python warns that preexec_fn is not safe with threads, as the
-            # server's logins are: what runs in the child before exec could
-            # wait for a lock another thread held. _take_terminal takes none,
-            # and nothing else gives the command its controlling terminal.
             self.popen(
+                through=_TAKE_TERMINAL if slave is not None else (),
                 stdin=child[0],
                 stdout=child[1],
                 stderr=child[2],
                 start_new_session=True,
-                preexec_fn=_take_terminal if slave is not None else None,
             )
         finally:
             for fd in close:

@@ -732,10 +732,12 @@ def test_clients_waiting_to_run_are_bounded(tmp_path):
         assert kind == remote.REFUSED and "too many clients waiting" in remote._json(payload)["message"]
         assert time.monotonic() - started < 3, "told at once, not after the wait"
     finally:
+        # The server first, while its one command runs: told to stop as it
+        # churns through sixteen clients gone, it would be stopped in any state.
+        s.stop()
         for channel in waiting:
             channel.sock.close()
         ended(first)
-        s.stop()
 
 
 def test_open_server_without_a_password_warns(tmp_path):
