@@ -234,6 +234,11 @@ def take_flag(command: Sequence[str], prog: str, default_port: int, variable: st
         raise RemoteError(f"{source}: {e}", 2) from None
 
 
+def not_available(words: str) -> str:
+    """How a refusal names what does not run remotely, wherever it is refused."""
+    return f"'{words}' is not available remotely"
+
+
 def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | None = None) -> str | None:
     """
     Tell why the server will not run a command line, or None if it will.
@@ -271,16 +276,16 @@ def refusal(argv: Sequence[str], deny: Sequence[str], allow: Sequence[str] | Non
     for entry in deny:
         steps = fold(entry)
         if steps and any(path[i : i + len(steps)] == steps for i in range(len(path))):
-            return f"'{entry}' is not available remotely"
+            return not_available(entry)
     if "server" in path and argv not in (["help", "server"], ["server", "--help"], ["server", "-h"]):
-        return "'server' is not available remotely"
+        return not_available("server")
     if allow is not None:
         command = path[1:] if path[:1] == ["help"] else path
         if command and command[0] not in ("help", "server") and not any(
                 command[: len(steps)] == steps for steps in map(fold, allow) if steps):
             shown = [w for w in words if not w.startswith("-")]
             hint = "; a flag with a value goes after the command" if words[0].startswith("-") else ""
-            return f"'{shown[len(path) - len(command)]}' is not available remotely{hint}"
+            return not_available(shown[len(path) - len(command)]) + hint
     return None
 
 
@@ -553,7 +558,12 @@ def serve(launch: Launch, deny: Sequence[str], allow: Sequence[str] | None, prog
     if not isinstance(bind, str) or not bind:
         raise RemoteError(f"{bind!r} is not an address to bind to", 2)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows: there SO_REUSEADDR would let another program bind the port
+        # while the server listens on it, and take its clients.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # restart at once on the same port
     try:
         listener.bind((bind, port))
         listener.listen(5)

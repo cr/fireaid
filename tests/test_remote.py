@@ -525,8 +525,7 @@ def test_chained_command_outside_allow_does_not_run(tmp_path):
     try:
         code, out, err = run(["chain", "bar", "--x", "9", "--remote", s.target])
         # bar would return "bar x=9"; instead the command refuses and produces nothing.
-        assert (code, out) == (2, "")
-        assert "'bar' is not available remotely" in err and "bar x=9" not in err
+        assert (code, out, err) == (2, "", "cli.py: 'bar' is not available remotely\n")
     finally:
         s.stop()
 
@@ -1052,6 +1051,138 @@ def log_in(port, password=None, mac=None):
     return channel, channel.read()
 
 
+def run_raw(port, request):
+    """
+    Log in and send a request by hand, as a client may send whatever it
+    likes. Returns ("refused", message, code) or ("ran", stdout, exit code).
+    """
+    channel, (kind, _) = log_in(port)
+    assert kind == remote.AUTH_OK
+    try:
+        channel.write(remote.RUN, request)
+        out = bytearray()
+        while True:
+            kind, payload = channel.read()
+            if kind == remote.REFUSED:
+                message = remote._json(payload)
+                return "refused", message["message"], message["code"]
+            if kind in (remote.STDOUT, remote.TTY):
+                out += payload
+            elif kind == remote.EXIT:
+                return "ran", out.decode(), remote._json(payload)["code"]
+    finally:
+        channel.sock.close()
+
+
+# -- what a client sends by hand: only what the protocol allows reaches the command
+
+
+def test_client_environment_is_filtered(server):
+    """
+    Only terminal variables, and only as text, go from a client to the
+    command: not PYTHONPATH, LD_PRELOAD or anything else that would change
+    what the command runs, and with an allow list get round it.
+    """
+    s = server("Probe")
+    injected = ["PYTHONPATH", "PYTHONSTARTUP", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "FIREAID_TEST_ALLOW"]
+    env = {"TERM": "sent-term", "COLUMNS": 123, **{name: "INJECTED" for name in injected}}
+    kind, out, code = run_raw(s.port, {"argv": ["env", "TERM", "COLUMNS", *injected], "tty": [False] * 3, "env": env})
+    assert (kind, code) == ("ran", 0)
+    assert "TERM=sent-term" in out, "a terminal variable goes along"
+    assert "COLUMNS=123" not in out, "a number is not text"
+    assert "INJECTED" not in out, "nothing else does"
+
+
+@pytest.mark.parametrize(
+    "request_, message",
+    [
+        ({"argv": "tty", "tty": [False] * 3}, "bad command line"),
+        ({"argv": ["tty", 5], "tty": [False] * 3}, "bad command line"),
+        ({"argv": ["tty"], "tty": [False, False]}, "bad terminal description"),
+        ({"argv": ["tty"], "tty": "000"}, "bad terminal description"),
+        ({"argv": ["tty"], "tty": [False] * 3, "env": ["TERM"]}, "bad environment"),
+        (b"not json", "bad message"),
+        (b"[1, 2]", "bad message"),
+    ],
+    ids=["argv not a list", "argv not text", "two terminals", "terminals not a list", "env not a map",
+         "not json", "not an object"],
+)
+def test_malformed_requests_are_refused(server, request_, message):
+    s = server("Probe")
+    assert run_raw(s.port, request_) == ("refused", message, 2)
+    assert run(["tty", "--remote", s.target], "Probe", input=b"")[0] == 0, "and the server goes on"
+
+
+def test_server_refuses_another_protocol(server):
+    s = server("Probe")
+    with socket.create_connection(("127.0.0.1", s.port), timeout=10) as sock:
+        channel = remote._Channel(sock)
+        channel.expect(remote.CHALLENGE)
+        channel.write(remote.HELLO, {"proto": 99})
+        kind, payload = channel.read()
+    assert kind == remote.REFUSED
+    assert remote._json(payload) == {
+        "message": f"this server speaks fireaid remote protocol {remote.PROTOCOL}, the client 99", "code": 1}
+
+
+def test_unexpected_message_in_the_handshake_is_refused(server):
+    s = server("Probe")
+    with socket.create_connection(("127.0.0.1", s.port), timeout=10) as sock:
+        channel = remote._Channel(sock)
+        channel.expect(remote.CHALLENGE)
+        channel.write(remote.RUN, {"argv": ["tty"], "tty": [False] * 3, "env": {}})  # before HELLO
+        kind, payload = channel.read()
+    assert (kind, remote._json(payload)) == (remote.REFUSED, {"message": f"unexpected message {remote.RUN}", "code": 2})
+
+
+def test_client_refuses_another_protocol():
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+
+    def other_server():
+        sock, _ = listener.accept()
+        remote._Channel(sock).write(remote.CHALLENGE, {"proto": 99, "nonce": "ab" * 32, "auth": False, "pty": False})
+        sock.settimeout(10)
+        try:
+            sock.recv(1)
+        except OSError:
+            pass
+        sock.close()
+
+    thread = threading.Thread(target=other_server)
+    thread.start()
+    result = run(["foo", "x", "--remote", f"127.0.0.1:{port}"])
+    thread.join(10)
+    listener.close()
+    assert result == (1, "", f"cli.py: 127.0.0.1:{port} speaks fireaid remote protocol 99, "
+                             f"this client speaks {remote.PROTOCOL}\n")
+
+
+def test_run_time_check_holds_by_itself(monkeypatch, capsys):
+    """In the command's own process the allow list holds by itself, not only behind the server's check of the text."""
+    monkeypatch.setenv(remote.CHILD_VARIABLE, "1")
+    monkeypatch.delenv("TOOL_REMOTE", raising=False)
+    ran = []
+
+    class Device:
+        def status(self):
+            return "ok"
+
+        def firmware(self):
+            ran.append("firmware")
+            return "flashed"
+
+    allow = fireaid.Remote(allow=("status",))
+    with pytest.raises(SystemExit) as exit:
+        fireaid.Fire(Device, command=["firmware"], name="tool", remote=allow)
+    assert exit.value.code == 2 and ran == []
+    assert capsys.readouterr().err == "tool: 'firmware' is not available remotely\n"
+    assert fireaid.Fire(Device, command=["status"], name="tool", remote=allow) == "ok"
+    # Outside a server's command, the same program runs anything.
+    monkeypatch.delenv(remote.CHILD_VARIABLE)
+    assert fireaid.Fire(Device, command=["firmware"], name="tool", remote=allow) == "flashed"
+
+
 def test_any_mac_is_refused_as_such(server):
     """A MAC that is not even ASCII fails authentication like any other wrong one."""
     s = server(password=True)
@@ -1503,10 +1634,10 @@ def test_interrupt_without_a_terminal(server, pipes):
 # -- Terminals
 
 
-def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"", **variables):
+def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"", resize=None, **variables):
     """Run the test program, remote-controlled, on a terminal; see support.on_terminal."""
     env = environment(component, TERM="xterm-256color", **variables)
-    return run_on_terminal(argv, env, stdout_tty, keys, wait_for)
+    return run_on_terminal(argv, env, stdout_tty, keys, wait_for, resize)
 
 
 @unix
@@ -1576,6 +1707,83 @@ def test_escape_from_a_raw_terminal(server):
     code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\r~.", wait_for=b"started")
     assert code == 255
     assert Said.disconnected(output, target)
+
+
+@unix
+def test_terminal_resized_during_a_command(server):
+    """The command's terminal follows the client's as it is resized, as a local one would."""
+    target = server("Probe").target
+    local = on_terminal(["resized"], wait_for=b"started", resize=(30, 100))
+    assert local[0] == 0 and local[1].endswith("100x30\n")
+    code, output, _ = on_terminal(["resized", "--remote", target], wait_for=b"started", resize=(30, 100))
+    assert code == 0 and output.endswith("100x30\n")
+
+
+@unix
+def test_second_ctrl_c_leaves_the_client(server):
+    """
+    Where Ctrl-C reaches the client, its terminal being cooked, a second
+    one within a second leaves it, whatever the command makes of the first.
+    """
+    target = server("Probe", pipes=True).target
+    started = time.monotonic()
+    code, output, _ = on_terminal(["deaf", "--remote", target], keys=[b"\x03", b"\x03"], wait_for=b"started")
+    assert code == 128 + signal.SIGINT
+    assert time.monotonic() - started < 20, "not after the command's 30 s"
+
+
+@pytest.mark.parametrize(
+    "spec, script, prefix",
+    [
+        ("pkg.__main__", None, ("-m", "pkg")),  # python -m pkg
+        ("pkg.tool", None, ("-m", "pkg.tool")),  # python -m pkg.tool
+        (None, "tool.py", ("tool.py",)),  # python tool.py, or tool.py with its #!
+        (None, "tool.exe", ()),  # a console script's launcher on Windows: run as it is
+    ],
+)
+def test_launch_starts_the_program_again(monkeypatch, tmp_path, spec, script, prefix):
+    import types
+
+    monkeypatch.chdir(tmp_path)
+    main = types.SimpleNamespace(__spec__=types.SimpleNamespace(name=spec) if spec else None)
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    if script:
+        (tmp_path / script).write_text("")
+    monkeypatch.setattr(sys, "argv", [script or "-m"])
+    launch = remote.Launch.capture()
+    expected = (script,) if script and script.endswith(".exe") else (sys.executable, *prefix)
+    assert (launch.prefix, launch.cwd, launch.error) == (expected, str(tmp_path), None)
+
+
+def test_launch_without_a_script_says_so(monkeypatch, tmp_path):
+    import types
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(sys.modules, "__main__", types.SimpleNamespace(__spec__=None))
+    monkeypatch.setattr(sys, "argv", ["nonesuch.py"])
+    launch = remote.Launch.capture()
+    assert launch.prefix == () and launch.error == "cannot start this program again: nonesuch.py is not a file"
+
+
+@pytest.mark.parametrize(
+    "argv, code, message",
+    [
+        (["--port", "70000"], 2, "cli.py: 70000 is not a port\n"),
+        (["--port=-1"], 2, "cli.py: -1 is not a port\n"),
+        (["--bind", ""], 2, "cli.py: '' is not an address to bind to\n"),
+    ],
+)
+def test_server_startup_errors(argv, code, message):
+    result = run(["server", "--bind", "127.0.0.1", *argv] if "--bind" not in argv else ["server", *argv])
+    assert result[0] == code and result[2].endswith(message), result
+
+
+def test_server_port_in_use_is_reported(server):
+    """A second server on a port in use says so, rather than sharing or taking it."""
+    port = server().port
+    code, out, err = run(["server", "--port", str(port), "--bind", "127.0.0.1"])
+    assert (code, out) == (1, "")
+    assert err.splitlines()[-1].startswith(f"cli.py: cannot listen on 127.0.0.1:{port}: ")
 
 
 @unix

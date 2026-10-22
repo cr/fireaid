@@ -235,6 +235,23 @@ def test_help_for_a_class_that_needs_arguments_is_fires(run):
     assert "COMMANDS" not in result.out
 
 
+def test_help_for_a_class_that_cannot_start_is_fires(run):
+    # Its constructor fails without arguments: there is no instance to show.
+    result = run("help", component="Fragile")
+    assert result.code == 0 and result.err == ""
+    assert result.out == native_help(run, "", component="Fragile", help=True)
+
+
+def test_help_for_an_undocumented_class_with_flags(run):
+    # No DESCRIPTION to put the flags after: they follow the SYNOPSIS.
+    out = run("help", component="Undocumented").out
+    assert "DESCRIPTION" not in out
+    assert "\nSYNOPSIS\n    cli.py <flags> " in out
+    assert out.index("SYNOPSIS\n") < out.index("FLAGS\n") < out.index("COMMANDS\n")
+    assert "\n    --verbose=VERBOSE\n" in out or "\n    -v, --verbose=VERBOSE\n" in out
+    assert "     go\n" in out
+
+
 def test_native_help_for_a_class_is_fires(run):
     for component in ("Configured", "Needy"):
         result = run("-- --help", component=component)

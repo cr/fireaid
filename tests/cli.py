@@ -170,6 +170,22 @@ class Probe(CLI):
             sys.exit(130)
         return "slept"
 
+    def deaf(self, seconds=30):
+        """Sleep, ignoring Ctrl-C, as a command busy with what it must finish."""
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        return self.sleep(seconds)
+
+    def resized(self, seconds=10):
+        """Say started, then the terminal's size once it has changed."""
+        changed = []
+        signal.signal(signal.SIGWINCH, lambda *_: changed.append(True))
+        print("started", flush=True)
+        deadline = time.monotonic() + seconds
+        while not changed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        columns, lines = os.get_terminal_size(1)
+        return f"{columns}x{lines}"
+
     def stubborn(self, seconds=30):
         """Sleep, ignoring SIGHUP, as a command that cleans up first would."""
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -187,6 +203,24 @@ class Configured(CLI):
     def __init__(self, verbose=False):
         super().__init__()
         self.verbose = verbose
+
+
+class Fragile:
+    """Fragile doc."""
+
+    def __init__(self, verbose=False):
+        raise RuntimeError("cannot start here")
+
+    def go(self):
+        """Go doc."""
+
+
+class Undocumented:
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+
+    def go(self):
+        """Go doc."""
 
 
 class Needy:

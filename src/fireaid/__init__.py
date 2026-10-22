@@ -741,7 +741,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
             # In the command's own process on the server: hold the command to
             # what is allowed as it actually runs, chained calls included,
             # where the server's check of the command line as text cannot.
-            enforce_allow = remote.allow
+            enforce_allow = remote.allow, prog
 
     ours = not (inspect.isroutine(component) or _member(component, "help")[0])
     undo = None
@@ -764,7 +764,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
 
 
 @contextmanager
-def _allowed_calls(allow: Sequence[str]) -> Any:
+def _allowed_calls(allow: Sequence[str], prog: str) -> Any:
     """
     Hold a running command to the allowed paths, by what Fire takes.
 
@@ -780,7 +780,8 @@ def _allowed_calls(allow: Sequence[str]) -> Any:
     Only the command's own run is held so: what the command does with
     Fire itself, in a nested call, is its own business. A refusal ends
     the run at once, without Fire's usage text, which would read every
-    member, properties included, to list them.
+    member, properties included, to list them, and says so as the server
+    would, but for the server's address, which only the client knows.
     """
     allowed = [tuple(w.replace("-", "_") for w in entry.split()) for entry in allow]
     run, get_member, call = _fire.core._Fire, _fire.core._GetMember, _fire.core._CallAndUpdateTrace
@@ -789,7 +790,7 @@ def _allowed_calls(allow: Sequence[str]) -> Any:
     depth = [0]  # Fire runs under way: 1 is the command's own
 
     def refuse(words: str) -> None:
-        print(f"ERROR: {words!r} is not available remotely", file=sys.stderr)
+        print(f"{prog}: {_remote_module().not_available(words)}", file=sys.stderr)
         raise _fire.core.FireExit(2, None)
 
     def _Fire(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
@@ -851,7 +852,7 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, enforce_allow:
         sys.stdout, sys.stderr = map(_unstripped, streams)
     try:
         with _hints.typed_parsing(), \
-                (_allowed_calls(enforce_allow) if enforce_allow is not None else nullcontext()):
+                (_allowed_calls(*enforce_allow) if enforce_allow is not None else nullcontext()):
             result = _fire.Fire(*args, **kwargs)
     finally:
         sys.stdout, sys.stderr = streams

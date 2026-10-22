@@ -344,6 +344,19 @@ def test_bare_parameters_are_fires():
     assert fireaid.Fire(fn, command=["5", "1e3", "[1]"]) == (5, (1000.0, [1]))
 
 
+def test_hint_text_that_cannot_be_evaluated():
+    """Optional[str] in a module that does not import Optional: its words still say what it reads."""
+    import types
+
+    def fn(value=None):
+        return value
+
+    bare = types.FunctionType(fn.__code__, {"__builtins__": __builtins__}, "fn", fn.__defaults__)
+    bare.__annotations__ = {"value": "Optional[str]"}
+    assert fireaid.Fire(bare, command=["--value", "5"]) == "5"
+    assert fireaid.Fire(bare, command=["--value", "None"]) is None
+
+
 def test_bool_flags():
     def fn(flag: bool = False):
         return flag

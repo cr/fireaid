@@ -39,13 +39,15 @@ def environment(module="fireaid", component="CLI", **variables):
     return env
 
 
-def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b""):
+def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b"", resize=None):
     """
     Run the test program with a terminal of 80x24 as stdin and stderr,
     and as stdout too unless stdout_tty is false: then stdout is a pipe.
-    Writes keys to the terminal once wait_for has appeared there, at
-    once for b"". Returns the exit code, the terminal's output and
-    stdout's. A program still running after 30 seconds is killed.
+    Once wait_for has appeared there, at once for b"", writes keys to
+    the terminal, a list of them a moment apart, and resizes it to
+    resize, as (rows, columns). Returns the exit code, the terminal's
+    output and stdout's. A program still running after 30 seconds is
+    killed.
     """
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
@@ -68,8 +70,14 @@ def on_terminal(argv, env, stdout_tty=True, keys=None, wait_for=b""):
     try:
         while time.monotonic() < deadline:
             if keys is not None and wait_for in output:
-                os.write(master, keys)
+                for i, key in enumerate(keys if isinstance(keys, list) else [keys]):
+                    if i:
+                        time.sleep(0.3)
+                    os.write(master, key)
                 keys = None
+            if resize is not None and wait_for in output:
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", *resize, 0, 0))
+                resize = None
             if not select.select([master], [], [], 1)[0]:
                 continue
             try:
