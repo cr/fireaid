@@ -205,6 +205,12 @@ class Configured(CLI):
         self.verbose = verbose
 
 
+class Greeting:
+    def gruss(self, name="Welt"):
+        """Sagt Grüße."""
+        return f"Grüße, {name}"
+
+
 class Fragile:
     """Fragile doc."""
 

@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import inspect
 import os
+import sys
 from importlib import metadata
 
 import fire
@@ -259,6 +260,41 @@ def test_fire_within_fire_leaves_the_outer_call_as_it_was(capsys):
     assert captured.err == ""
     assert captured.out.startswith("foo x\n")  # the sub-tool's result
     assert "tool nested x - A box." in captured.out
+
+
+class Greeting:
+    def gruss(self, name="Welt"):
+        """Sagt Grüße."""
+        return f"Grüße, {name}"
+
+
+def test_help_with_stdout_closed(monkeypatch):
+    """With stdout closed, as cron or a daemon may run a tool, help is written nowhere, as print() would."""
+    monkeypatch.setattr(sys, "stdout", None)
+    for command in ("--help", "help gruss", ""):
+        with pytest.raises(fire.core.FireExit) as exit:
+            fireaid.Fire(Greeting, command=command, name="tool")
+        assert exit.value.code in (0, 2)
+
+
+def test_help_in_an_encoding_that_cannot_take_it(monkeypatch):
+    """What stdout's encoding cannot take is written escaped, as Python writes stderr, not a crash."""
+    import io
+
+    raw = io.BytesIO()
+    ascii_out = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", ascii_out)
+    with pytest.raises(fire.core.FireExit) as exit:
+        fireaid.Fire(Greeting, command="gruss --help", name="tool")
+    assert exit.value.code == 0
+    assert "tool gruss - Sagt Gr\\xfc\\xdfe." in raw.getvalue().decode("ascii")
+
+
+def test_help_redirected_in_an_encoding_that_cannot_take_it(run):
+    """As tool --help > file does on Windows, where a redirected stdout takes the code page's encoding."""
+    result = run("gruss --help", component="Greeting", PYTHONIOENCODING="ascii")
+    assert (result.code, result.err) == (0, "")
+    assert "cli.py gruss - Sagt Gr\\xfc\\xdfe." in result.out
 
 
 def test_remote_config():

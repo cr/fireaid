@@ -480,6 +480,37 @@ def test_lists_are_command_paths(lists):
         fireaid.Remote(**lists)
 
 
+@pytest.mark.parametrize(
+    "settings, error",
+    [
+        ({"port": "4247"}, TypeError),
+        ({"port": True}, TypeError),
+        ({"port": 4247.0}, TypeError),
+        ({"port": 0}, ValueError),  # a client needs a port to go to
+        ({"port": 65536}, ValueError),
+        ({"env": 5}, TypeError),
+        ({"env": ""}, ValueError),
+        ({"env": "has space"}, ValueError),
+        ({"env": "9LIVES"}, ValueError),
+        ({"setup": "log"}, TypeError),
+    ],
+    ids=repr,
+)
+def test_remote_settings_are_checked_at_once(settings, error):
+    """A mistake is reported where the program makes its Remote, not when a server starts, or every command line."""
+    with pytest.raises(error):
+        fireaid.Remote(**settings)
+
+
+def test_remote_settings_that_are_fine():
+    def setup(debug):
+        pass
+
+    remote_ = fireaid.Remote(port=1, env="TOOL_HOST", setup=setup)
+    assert (remote_.port, remote_.env, remote_.setup) == (1, "TOOL_HOST", setup)
+    assert fireaid.Remote(port=65535, env=None, setup=None).port == 65535
+
+
 def test_lists_become_tuples():
     assert fireaid.Remote().allow is None and fireaid.Remote().deny == ()
     assert fireaid.Remote(allow=["status"], deny=["firmware"]) == fireaid.Remote(allow=("status",), deny=("firmware",))

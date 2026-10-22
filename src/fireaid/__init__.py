@@ -94,6 +94,8 @@ _USAGE_ITEMS = re.compile(r"^(  )([a-z ]+:)( +)(.*)$")
 _USAGE_ITEM = re.compile(r"[^\s|]+")
 _USAGE_MORE = re.compile(r"^( {20,})(.*)$")
 
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # what a shell can set
+
 # The sections of Fire's help.
 _SECTION_BREAK = re.compile(r"\n\n(?=[A-Z][A-Z ]*\n)")
 _SYNOPSIS_NAME = re.compile(r"^(SYNOPSIS\n    \S+)")
@@ -313,6 +315,19 @@ class Remote:
             if isinstance(value, str) or not all(isinstance(entry, str) for entry in value):
                 raise TypeError(f"{name} must be a tuple of command paths, such as ('status',), not {value!r}")
             object.__setattr__(self, name, tuple(value))
+        # The rest would fail far from the mistake: when a server starts, or,
+        # for env, on every command line, local ones included.
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise TypeError(f"port must be a number, not {self.port!r}")
+        if not 0 < self.port < 65536:
+            raise ValueError(f"port must be from 1 to 65535, not {self.port}")
+        if self.env is not None:
+            if not isinstance(self.env, str):
+                raise TypeError(f"env must be the name of an environment variable, not {self.env!r}")
+            if not _VARIABLE_NAME.fullmatch(self.env):
+                raise ValueError(f"env must be a name a shell can set, such as TOOL_REMOTE, not {self.env!r}")
+        if self.setup is not None and not callable(self.setup):
+            raise TypeError(f"setup must be a function, called with the server's --debug flag, not {self.setup!r}")
 
 
 def _remote_config(remote: Any) -> Any:
@@ -509,8 +524,20 @@ def _display_stdout(lines: Sequence[str], out: Any = None) -> None:
     """
     Stand in for fire.core.Display, printing to stdout instead of stderr,
     and not through a pager.
+
+    Fire's help goes to stderr, which Python writes with what its encoding
+    cannot take escaped; stdout does the same here, so that help in a
+    narrower encoding, such as a redirected one on Windows, is not a
+    crash. A closed stdout takes nothing, as with print().
     """
-    sys.stdout.write("\n".join(lines) + "\n")
+    stream = sys.stdout
+    if stream is None:
+        return
+    text = "\n".join(lines) + "\n"
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, "backslashreplace").decode(encoding)
+    stream.write(text)
 
 
 def _display_unpaged(lines: Sequence[str], out: Any) -> None:
