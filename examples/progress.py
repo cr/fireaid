@@ -118,7 +118,7 @@ def show_progress(description: str, unit: str):
         yield lambda done, total: bar.update(task, completed=done, total=total)
 
 
-# The command line. fireaid makes it from the class, with help for every command.
+# The command line. fireaid makes it from an instance, with help for every command.
 
 class Tool:
     """Copy nothing, with a progress bar and log lines in colour.

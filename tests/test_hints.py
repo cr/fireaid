@@ -16,6 +16,7 @@ import fire
 import pytest
 
 import fireaid
+from fireaid import hints
 
 
 @pytest.mark.parametrize(
@@ -103,38 +104,6 @@ def test_fire_is_restored_after_the_call():
 def test_metadata_is_not_written_to_the_program():
     assert fireaid.Fire(typed, command=["5"]) == ("5", 1)
     assert not hasattr(typed, fire.decorators.FIRE_METADATA)
-
-
-@pytest.mark.parametrize(
-    "hint, expected",
-    [
-        (str, True),
-        ("str", True),
-        ("str | None", True),
-        ("None | str", True),
-        ("Optional[str]", True),
-        ("typing.Optional[str]", True),
-        (int, False),
-        ("int", False),
-        ("str | int", False),
-        ("list[str]", False),
-        ("Optional[int]", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_hints_that_mean_str(hint, expected):
-    assert fireaid._is_str_hint(hint) is expected
-
-
-def test_object_hints_that_mean_str():
-    from typing import Optional, Union
-
-    assert fireaid._is_str_hint(Optional[str]) is True
-    assert fireaid._is_str_hint(Union[str, None]) is True
-    assert fireaid._is_str_hint(Union[str, int]) is False
-    assert fireaid._is_str_hint(Optional[int]) is False
-    assert fireaid._is_str_hint(list) is False
 
 
 # -- Other hints, in process
@@ -247,7 +216,6 @@ def test_hinted_value(hint, text, expected):
     def fn(value: hint = None):
         return value
 
-    fn.__annotations__ = {"value": hint}
     assert fireaid.Fire(fn, command=["--value", text]) == expected
 
 
@@ -283,7 +251,6 @@ def test_hinted_value_rejected(hint, text, form, capsys):
     def fn(value: hint = None):
         return value
 
-    fn.__annotations__ = {"value": hint}
     with pytest.raises(fire.core.FireExit) as e:
         fireaid.Fire(fn, command=["--value", text])
     assert e.value.code == 2
@@ -346,7 +313,7 @@ def test_subclass_of_int_with_its_own_constructor():
 def test_generic_hints_are_not_classes():
     # On Python 3.9 and 3.10 inspect.isclass(list[int]) is True, and issubclass raises.
     for hint in (list[int], dict[str, int], Optional[list[int]], tuple[int, ...]):
-        assert fireaid._parser_for(hint) is None
+        assert hints._parser_for(hint) is None
 
 
 def test_subclass_of_datetime():

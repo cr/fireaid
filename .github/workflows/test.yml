@@ -1,7 +1,8 @@
 # Runs the tests on every push and pull request: on Linux, macOS and
 # Windows, each on the oldest Python fireaid supports and the latest
-# stable one. Remote control and terminal tests skip on Windows, where
-# fireaid has no remote control.
+# stable one, with the latest stable Fire; and on Linux with the oldest
+# Python and the oldest Fire. Terminal tests skip on Windows, which has
+# no pseudo-terminals.
 
 name: Test
 
@@ -30,3 +31,12 @@ jobs:
       - run: python -m pip install --quiet --editable ".[test]"
       - run: python -m pip install --quiet --upgrade fire
       - run: python -m pytest
+
+  test-min:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+      - run: make test-min PYTHON_MIN=python

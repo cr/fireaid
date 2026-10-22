@@ -2,6 +2,8 @@
 What fireaid adds: Git-style help, and clean help on stdout.
 """
 
+import re
+
 import pytest
 
 BANNER = "INFO: Showing help"
@@ -68,8 +70,7 @@ def test_help_is_for_the_result_of_the_command_line(run):
     result = run("effect x --help")
     assert result.code == 0
     assert result.err == ""
-    assert result.out.startswith("EFFECT\n")
-    assert 'The string "x"' in result.out
+    assert result.out == "EFFECT\n" + run("effect x -- --help", module="fire").err
 
 
 def test_help_for_a_command_does_not_run_it(run):
@@ -220,7 +221,7 @@ def test_help_for_a_class_with_flags(run):
     assert result.code == 0 and result.err == ""
     out = result.out
     assert "\nSYNOPSIS\n    cli.py <flags> GROUP | COMMAND | VALUE\n\nDESCRIPTION\n    Configured doc.\n\nFLAGS\n" in out
-    assert "\n    -v, --verbose=VERBOSE\n" in out
+    assert re.search(r"\n    (-v, )?--verbose=VERBOSE\n", out)  # the short flag from Fire 0.5.0 on
     assert out.index("FLAGS\n") < out.index("GROUPS\n") < out.index("COMMANDS\n") < out.index("VALUES\n")
     assert "     dynamic\n" in out and "     foo\n" in out and "     verbose\n" in out
     assert run("--help", component="Configured") == result

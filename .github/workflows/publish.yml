@@ -25,8 +25,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: make test PYTHON=python
 
+  test-min:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+      - run: make test-min PYTHON_MIN=python
+
   build:
-    needs: test
+    needs: [test, test-min]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

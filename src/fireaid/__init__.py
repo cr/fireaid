@@ -39,42 +39,61 @@ and exits with an error, where Fire shows the full help as a success.
 
 On a terminal, usage text and help are coloured.
 
+Values are read as the parameters' type hints say, where Fire reads
+every value as a Python literal.
+
 ``Fire(component, remote=True)`` adds a ``server`` command and a
 ``--remote`` flag, which runs a command line on such a server.
 """
 
 from __future__ import annotations
 
-import datetime
-import decimal
-import enum
-import fractions
-import functools
 import importlib
 import inspect
-import ipaddress
-import math
 import os
-import pathlib
 import re
 import shlex
 import sys
-import typing
-import uuid
 from collections.abc import Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata as _metadata
 from typing import Any
 
 import fire as _fire
 
+from . import hints as _hints
+
 __all__ = ["Fire"]
+
+# What fireaid stands in for while Fire runs.
+_display = _fire.core.Display
+_helptext = _fire.core.helptext
+_formatting = _fire.core.formatting
 
 _HELP = ["--", "--help"]
 _FLAGS = ("-h", "--help")
-_NOT_CALLED = ("Initial component", "Instantiated class", "Accessed property")
+_NOT_CALLED = (_fire.trace.INITIAL_COMPONENT, _fire.trace.INSTANTIATED_CLASS, _fire.trace.ACCESSED_PROPERTY)
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+
+# What colours what, as the parameters of an ANSI escape sequence.
+# Headings are bold light blue, labels within the text light blue, the
+# names of commands and flags light green, placeholders yellow.
+_HEADING = "1;94"
+_LABEL = "94"
+_NAME = "92"
+_PLACEHOLDER = "33"
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_FLAG_LINE = re.compile(r"^(    )((?:-\w, )?--[\w-]+)", re.MULTILINE)
+_NAME_LINE = re.compile(r"^(     )(\S+)$")
+_USAGE_ITEMS = re.compile(r"^(  )([a-z ]+:)( +)(.*)$")
+_USAGE_ITEM = re.compile(r"[^\s|]+")
+_USAGE_MORE = re.compile(r"^( {20,})(.*)$")
+
+# The sections of Fire's help.
+_SECTION_BREAK = re.compile(r"\n\n(?=[A-Z][A-Z ]*\n)")
+_SYNOPSIS_NAME = re.compile(r"^(SYNOPSIS\n    \S+)")
+_LISTS = ("GROUPS\n", "COMMANDS\n", "VALUES\n", "INDEXES\n", "NOTES\n")
 
 
 def _member(component: Any, name: str) -> tuple[bool, Any]:
@@ -186,9 +205,9 @@ def _normalize_help(argv: Sequence[str], component: Any, ours: bool) -> list[str
     return argv[:-1] + _HELP
 
 
-def _help_command(component: Any, name: Any) -> tuple[Any, Any]:
+def _help_command(component: Any, name: Any) -> Any:
     """
-    Make the help command of a component, as a function and as a method.
+    Make the help command of a component.
 
     Command lines starting with ``help`` are translated before Fire sees
     them, so this is mostly there for Fire to list with the component's
@@ -205,29 +224,32 @@ def _help_command(component: Any, name: Any) -> tuple[Any, Any]:
         words = [str(word) for word in command]
         return _fire_with(_display_stdout, component, command=words + _HELP, name=name)
 
-    def method(self, *command):
-        return help(*command)
-
-    method.__name__ = help.__name__
-    method.__doc__ = help.__doc__
-    return help, method
+    return help
 
 
 def _add_help(component: Any, name: Any = None) -> tuple[Any, Any]:
-    """
-    Give a component a help command.
-
-    Returns the component to pass to Fire, and a function to undo it.
-    A dict gets a copy with the command added. A module gets it as an
-    attribute, and anything else as a method of its class, for as long
-    as Fire runs. A component that cannot take one is returned as it is.
-    """
-    return _add_member(component, "help", *_help_command(component, name))
+    """Give a component the help command, as _add_member does."""
+    return _add_member(component, "help", _help_command(component, name))
 
 
-def _add_member(component: Any, attribute: str, function: Any, method: Any) -> tuple[Any, Any]:
+def _as_method(function: Any) -> Any:
+    """The function as a method that ignores its instance, and looks to Fire like the function."""
+
+    def method(self, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    signature = inspect.signature(function)
+    instance = inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    method.__signature__ = signature.replace(parameters=[instance, *signature.parameters.values()])
+    method.__name__ = function.__name__
+    method.__doc__ = function.__doc__
+    method.__annotations__ = dict(function.__annotations__)
+    return method
+
+
+def _add_member(component: Any, attribute: str, function: Any) -> tuple[Any, Any]:
     """
-    Give a component a command, as a function or as a method.
+    Give a component a command.
 
     Returns the component to pass to Fire, and a function to undo it.
     A dict gets a copy with the command added. A module gets it as an
@@ -239,9 +261,9 @@ def _add_member(component: Any, attribute: str, function: Any, method: Any) -> t
     if inspect.ismodule(component):
         owner, member = component, function
     elif inspect.isclass(component):
-        owner, member = component, method
+        owner, member = component, _as_method(function)
     else:
-        owner, member = type(component), method
+        owner, member = type(component), _as_method(function)
     try:
         setattr(owner, attribute, member)
     except (AttributeError, TypeError):
@@ -280,12 +302,16 @@ def _remote_config(remote: Any) -> Any:
     return remote
 
 
-def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tuple[Any, Any]:
-    """Make the server command, as a function and as a method."""
-    port = remote.port
+def _remote_module() -> Any:
+    """fireaid.remote, imported only for a program that asks for remote control."""
+    return importlib.import_module(__name__ + ".remote")
 
-    def server(port=port, password=None, bind="0.0.0.0", debug=False):
-        module = importlib.import_module(__name__ + ".remote")
+
+def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> Any:
+    """Make the server command."""
+
+    def server(port=remote.port, password=None, bind="0.0.0.0", debug=False):
+        module = _remote_module()
         if remote.setup is not None:
             remote.setup(bool(debug))
         try:
@@ -293,9 +319,6 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
         except module.RemoteError as e:
             print(f"{prog}: {e}", file=sys.stderr)
             raise SystemExit(e.code) from None
-
-    def method(self, port=port, password=None, bind="0.0.0.0", debug=False):
-        return server(port, password, bind, debug)
 
     local = ""
     if remote.deny:
@@ -306,8 +329,9 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
         A client runs a command here by adding --remote [PASSWORD@]HOST[:PORT]
         anywhere on its command line, or by setting {variable}. An empty
         --remote= runs the command locally. Without a password, anyone who
-        can reach the port may run commands; with one, the connection is
-        authenticated. It is not encrypted either way.
+        can reach the port may run commands; with one, clients are
+        authenticated by HMAC challenge-response. The connection is not
+        encrypted either way.
 
         Each command runs in a new process of this program, as if typed
         here. Its output, input and exit code are relayed, and it sees a
@@ -324,27 +348,7 @@ def _server_command(remote: Remote, prog: str, variable: str, launch: Any) -> tu
         """
     # Types for the help, as objects: this module's annotations are strings.
     server.__annotations__ = {"port": int, "password": str, "bind": str, "debug": bool}
-    method.__annotations__ = dict(server.__annotations__)
-    method.__name__ = server.__name__
-    method.__doc__ = server.__doc__
-    return server, method
-
-
-
-# What colours what, as the parameters of an ANSI escape sequence.
-# Headings are bold light blue, labels within the text light blue, the
-# names of commands and flags light green, placeholders yellow.
-_HEADING = "1;94"
-_LABEL = "94"
-_NAME = "92"
-_PLACEHOLDER = "33"
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
-_FLAG_LINE = re.compile(r"^(    )((?:-\w, )?--[\w-]+)", re.MULTILINE)
-_NAME_LINE = re.compile(r"^(     )(\S+)$")
-_USAGE_ITEMS = re.compile(r"^(  )([a-z ]+:)( +)(.*)$")
-_USAGE_ITEM = re.compile(r"[^\s|]+")
-_USAGE_MORE = re.compile(r"^( {20,})(.*)$")
+    return server
 
 
 def _paint(style: str, text: str) -> str:
@@ -494,7 +498,7 @@ class _HelpText:
     left alone: the command was complete.
     """
 
-    def __init__(self, color_usage: bool, color_help: bool, conventional: bool, remote: Any = None) -> None:
+    def __init__(self, color_usage: bool, color_help: bool, conventional: bool, remote: Any) -> None:
         self.incomplete = None
         self.color_usage = color_usage
         self.color_help = color_help
@@ -524,7 +528,9 @@ class _HelpText:
         return _color_usage(text) if self.color_usage else text
 
 
-_LISTS = ("GROUPS\n", "COMMANDS\n", "VALUES\n", "INDEXES\n", "NOTES\n")
+def _section(sections: Sequence[str], heading: str) -> Any:
+    """The index of the section of help under heading, or None."""
+    return next((i for i, s in enumerate(sections) if s.startswith(heading + "\n")), None)
 
 
 def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Sequence[str], color: bool) -> str:
@@ -538,15 +544,14 @@ def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Seq
     except AttributeError:
         return text
     words = shlex.split(command)[1:]
-    module = importlib.import_module(__name__ + ".remote")
-    if words[:1] == ["help"] or module.refusal(words, deny) is not None:
+    if words[:1] == ["help"] or _remote_module().refusal(words, deny) is not None:
         return text
     placeholder = "[PASSWORD@]HOST[:PORT]"
     entry = (f"    --remote={_placeholder(placeholder) if color else placeholder}\n"
              f"        Run the command line on HOST, where `{prog} server` is running;\n"
              f"        see `{prog} help server`. {variable} gives it by default.")
     sections = _SECTION_BREAK.split(text)
-    flags = next((i for i, s in enumerate(sections) if s.startswith("FLAGS\n")), None)
+    flags = _section(sections, "FLAGS")
     if flags is not None:
         sections[flags] += "\n" + entry
         return "\n\n".join(sections)
@@ -554,10 +559,6 @@ def _with_remote_flag(text: str, trace: Any, prog: str, variable: str, deny: Seq
     sections.insert(at, "FLAGS\n" + entry)
     synopsis = re.compile(rf"^(SYNOPSIS\n    {re.escape(trace.GetCommand(include_separators=True))})( |$)")
     return "\n\n".join(synopsis.sub(r"\1 <flags>\2", s, count=1) for s in sections)
-
-
-_SECTION_BREAK = re.compile(r"\n\n(?=[A-Z][A-Z ]*\n)")
-_SYNOPSIS_NAME = re.compile(r"^(SYNOPSIS\n    \S+)", re.MULTILINE)
 
 
 def _class_help(component: Any, trace: Any, verbose: bool) -> Any:
@@ -584,20 +585,16 @@ def _class_help(component: Any, trace: Any, verbose: bool) -> Any:
     except Exception:
         return None
     text = _helptext.HelpText(instance, trace=trace, verbose=verbose)
-    sections = _SECTION_BREAK.split(_helptext.HelpText(component, trace=trace, verbose=verbose))
-    flags = next((s for s in sections if s.startswith("FLAGS\n")), None)
+    fires = _SECTION_BREAK.split(_helptext.HelpText(component, trace=trace, verbose=verbose))
+    flags = _section(fires, "FLAGS")
     if flags is None:
         return text
     sections = _SECTION_BREAK.split(text)
-    for heading in ("DESCRIPTION\n", "SYNOPSIS\n"):
-        after = next((i for i, s in enumerate(sections) if s.startswith(heading)), None)
-        if after is not None:
-            break
-    else:
-        after = 0
-    sections.insert(after + 1, flags)
-    return "\n\n".join(_SYNOPSIS_NAME.sub(r"\1 <flags>", s, count=1) if s.startswith("SYNOPSIS\n") else s
-                       for s in sections)
+    after = _section(sections, "DESCRIPTION")
+    if after is None:
+        after = _section(sections, "SYNOPSIS") or 0
+    sections.insert(after + 1, fires[flags])
+    return "\n\n".join(_SYNOPSIS_NAME.sub(r"\1 <flags>", s, count=1) for s in sections)
 
 
 def _without_separator(text: str, trace: Any) -> str:
@@ -619,242 +616,24 @@ def _without_separator(text: str, trace: Any) -> str:
     return re.sub(rf"^(  .*?) {sep} (?=--help$)", r"\1 ", text, count=1, flags=re.MULTILINE)
 
 
-_display = getattr(_fire.core, "Display", None)
-_helptext = getattr(_fire.core, "helptext", None)
-_formatting = getattr(_fire.core, "formatting", None)
-_decorators = getattr(_fire.core, "decorators", None)
-
-_fire_error = getattr(_fire.core, "FireError", ValueError)
-
-_OPTIONAL = re.compile(r"(?:typing\.)?Optional\[(.*)\]")
-_WORDS = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
-_UNIT = re.compile(r"(\d+(?:\.\d+)?)(ms|d|h|m|s)")
-_UNITS = re.compile(r"(?:\d+(?:\.\d+)?(?:ms|d|h|m|s))+")
-_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "ms": 0.001}
-_CLOCK = re.compile(r"(?:(-?\d+) days?, )?(-?\d+):(\d+)(?::(\d+(?:\.\d+)?))?")
-
-# Types whose constructor reads the text, and what they read. Earlier
-# entries win: an interface is an address too.
-_CONSTRUCTED = (
-    (str, "a string"),
-    (float, "a number"),
-    (complex, "a complex number"),
-    (decimal.Decimal, "a decimal number"),
-    (fractions.Fraction, "a fraction"),
-    (pathlib.PurePath, "a path"),
-    (uuid.UUID, "a UUID"),
-    (ipaddress.IPv4Interface, "an IP interface"),
-    (ipaddress.IPv6Interface, "an IP interface"),
-    (ipaddress.IPv4Address, "an IP address"),
-    (ipaddress.IPv6Address, "an IP address"),
-    (ipaddress.IPv4Network, "an IP network"),
-    (ipaddress.IPv6Network, "an IP network"),
-)
-
-
-def _unwrap(hint: Any) -> tuple[Any, bool]:
-    """The type within Optional[T], T | None and a NewType, and whether None is allowed."""
-    optional = False
-    if isinstance(hint, str):
-        # A hint that could not be evaluated: only its words are known.
-        text = hint.strip()
-        match = _OPTIONAL.fullmatch(text)
-        if match:
-            text, optional = match.group(1), True
-        parts = [part.strip() for part in text.split("|")]
-        if "None" in parts:
-            optional = True
-            parts = [part for part in parts if part != "None"]
-        return (parts[0] if len(parts) == 1 else hint), optional
-    args = typing.get_args(hint)
-    if args:
-        rest = [arg for arg in args if arg is not type(None)]
-        if len(rest) == len(args) or len(rest) != 1:
-            return hint, False  # a union of types, or a generic: Fire's
-        hint, optional = rest[0], True
-    while hasattr(hint, "__supertype__"):
-        hint = hint.__supertype__
-    return hint, optional
-
-
-def _is_str_hint(hint: Any) -> bool:
-    """Whether a type hint, as an object or as a string, means str or None."""
-    inner, _ = _unwrap(hint)
-    return inner is str or inner == "str"
-
-
-def _parse_bool(text: str) -> bool:
-    try:
-        return _WORDS[text.strip().lower()]
-    except KeyError:
-        raise ValueError(text) from None
-
-
-def _parse_enum(cls: Any, text: str) -> Any:
-    for name, member in cls.__members__.items():
-        if name.lower() == text.lower():
-            return member
-    for member in cls:
-        if str(member.value) == text:
-            return member
-    raise ValueError(text)
-
-
-def _parse_timedelta(cls: Any, text: str) -> Any:
-    text = text.strip()
-    try:
-        seconds = float(text)
-    except ValueError:
-        pass
-    else:
-        if not math.isfinite(seconds):
-            raise ValueError(text)
-        return cls(seconds=seconds)
-    match = _CLOCK.fullmatch(text)
-    if match:
-        days, hours, minutes, seconds = match.groups()
-        clock = cls(hours=abs(int(hours)), minutes=int(minutes), seconds=float(seconds or 0))
-        if days is not None:
-            return cls(days=int(days)) + clock
-        return -clock if hours.startswith("-") else clock
-    body = text.lstrip("+-")
-    if not _UNITS.fullmatch(body):
-        raise ValueError(text)
-    total = sum(float(number) * _SECONDS[unit] for number, unit in _UNIT.findall(body))
-    return cls(seconds=-total if text.startswith("-") else total)
-
-
-def _parser_for(hint: Any) -> Any:
-    """
-    How to read the text for a type hint: a function, what it reads,
-    and whether the text None means None. None for a hint that is left
-    to Fire.
-    """
-    hint, optional = _unwrap(hint)
-    if isinstance(hint, str):
-        if hint != "str":
-            return None
-        hint = str
-    if typing.get_origin(hint) is not None or not inspect.isclass(hint):
-        return None  # a generic such as list[int] is a class on Python 3.9 and 3.10
-    if hint is bool:
-        parse, form = _parse_bool, "true or false"
-    elif issubclass(hint, enum.Enum):
-        parse = functools.partial(_parse_enum, hint)
-        form = "one of " + ", ".join(name.lower() for name in hint.__members__)
-    elif issubclass(hint, int):
-        # The subclass may take only a value, so int reads the text first.
-        parse, form = (lambda text, _cls=hint: _cls(int(text, 0))), "an integer"
-    elif issubclass(hint, datetime.timedelta):
-        parse, form = functools.partial(_parse_timedelta, hint), "a duration: seconds, 1h30m or H:MM:SS"
-    elif issubclass(hint, datetime.datetime):
-        parse, form = hint.fromisoformat, "a date and time in ISO 8601"
-    elif issubclass(hint, datetime.date):
-        parse, form = hint.fromisoformat, "a date, YYYY-MM-DD"
-    elif issubclass(hint, datetime.time):
-        parse, form = hint.fromisoformat, "a time, HH:MM[:SS]"
-    else:
-        for cls, form in _CONSTRUCTED:
-            if issubclass(hint, cls):
-                parse = hint
-                break
-        else:
-            return None
-    return parse, form, optional
-
-
-def _parse_function(name: str, parse: Any, form: str, optional: bool) -> Any:
-    """A parse function for Fire, failing the way Fire reports."""
-
-    def parse_value(text: str) -> Any:
-        if optional and text == "None":
-            return None
-        try:
-            return parse(text)
-        except (ValueError, ArithmeticError, TypeError):
-            raise _fire_error(f"{name}: {text!r} is not {form}") from None
-
-    return parse_value
-
-
-def _parsers(component: Any) -> dict[str, Any]:
-    """Parse functions for the hinted parameters of what Fire is about to call."""
-    fn = component
-    if inspect.isclass(component):
-        fn = component.__init__
-    elif not inspect.isroutine(component):
-        fn = getattr(component, "__call__", None)
-    try:
-        annotations = dict(getattr(fn, "__annotations__", None) or {})
-        namespace = getattr(fn, "__globals__", None) or {}
-    except Exception:  # noqa: BLE001 - a program may hide anything behind __getattr__
-        return {}
-    parsers = {}
-    for name, hint in annotations.items():
-        if name == "return":
-            continue
-        if isinstance(hint, str):
-            try:
-                hint = eval(hint, dict(namespace))  # noqa: S307 - as typing.get_type_hints reads it
-            except Exception:  # noqa: BLE001 - then only its words are known
-                pass
-        found = _parser_for(hint)
-        if found is not None:
-            parsers[name] = _parse_function(name, *found)
-    return parsers
-
-
-@contextmanager
-def _typed_parsing() -> Any:
-    """
-    Have Fire read values as the parameters' type hints say.
-
-    Fire reads a function's parse functions from its metadata when it
-    calls it. For the duration of the call, the metadata gains a parse
-    function for each parameter whose hint fireaid reads, where the
-    program has not set parse functions of its own with fire.decorators.
-    """
-    original = getattr(_decorators, "GetMetadata", None)
-    key = getattr(_decorators, "FIRE_PARSE_FNS", None)
-    if original is None or key is None:
-        yield
-        return
-
-    def GetMetadata(component: Any) -> Any:  # noqa: N802 - Fire's name
-        metadata = original(component)
-        parse_fns = metadata.get(key) or {"default": None, "positional": [], "named": {}}
-        named = _parsers(component)
-        if not named or parse_fns.get("default") is not None:
-            return metadata
-        named.update(parse_fns["named"])
-        return {**metadata, key: {**parse_fns, "named": named}}
-
-    _decorators.GetMetadata = GetMetadata
-    try:
-        yield
-    finally:
-        _decorators.GetMetadata = original
-
 # Obtain the signature from the installed Fire version instead of
 # duplicating it here. This makes fireaid less dependent on Fire's
 # particular API version.
 _FIRE_SIGNATURE = inspect.signature(_fire.Fire)
 
 
+# fireaid.Fire keeps fire.Fire's docstring, set below. What it does on
+# top: all arguments other than ``component`` and ``command`` are passed
+# through unchanged. The command, by default taken from sys.argv, is
+# normalized first, making this work:
+#
+#     fire.Fire(MyCLI, command=["foo", "--help"])
+#     fire.Fire(MyCLI, command="help foo")
+#
+# Values are read as the parameters' type hints say. With ``remote``,
+# True or a ``fireaid.Remote``, the program gets a ``server`` command
+# and a ``--remote [PASSWORD@]HOST[:PORT]`` flag.
 def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
-    """
-    Call fire.Fire(), adding conventional command-line help handling.
-
-    All arguments other than ``component`` and ``command`` are passed
-    through unchanged. The command, by default taken from sys.argv, is
-    normalized first, making this work:
-
-        fire.Fire(MyCLI, command=["foo", "--help"])
-        fire.Fire(MyCLI, command="help foo")
-
-    With ``remote``, True or a ``fireaid.Remote``, the program gets a
-    ``server`` command and a ``--remote [PASSWORD@]HOST[:PORT]`` flag.
-    """
     remote = _remote_config(remote)
     bound = _FIRE_SIGNATURE.bind_partial(*args, **kwargs)
     arguments = bound.arguments
@@ -879,7 +658,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
     undo_server = None
     remote_help = None
     if remote is not None:
-        module = importlib.import_module(__name__ + ".remote")
+        module = _remote_module()
         prog = arguments.get("name") or os.path.basename(sys.argv[0] if sys.argv else "")
         variable = module.environment_variable(prog, remote.env)
         if inspect.isroutine(component):
@@ -898,8 +677,7 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
             raise SystemExit(e.code) from None
         arguments["command"] = command
         launch = module.Launch.capture()
-        component, undo_server = _add_member(component, "server",
-                                             *_server_command(remote, prog, variable, launch))
+        component, undo_server = _add_member(component, "server", _server_command(remote, prog, variable, launch))
         arguments["component"] = component
         remote_help = (prog, variable, remote.deny)
 
@@ -925,40 +703,30 @@ def Fire(*args: Any, remote: Any = False, **kwargs: Any) -> Any:
 
 def _fire_with(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any) -> Any:
     """
-    Call fire.Fire() with a stand-in for its display of help.
+    Call fire.Fire() with stand-ins for its display of help and its parsing.
 
     On a terminal, usage text is coloured, and so is help that was asked
     for in conventional syntax. Help in Fire's native syntax is Fire's.
+    Values are read as the parameters' type hints say.
     """
-    with _typed_parsing():
-        return _fire_with_help(display, *args, remote_help=remote_help, **kwargs)
-
-
-def _fire_with_help(display: Any, *args: Any, remote_help: Any = None, **kwargs: Any) -> Any:
-    if _display is None or _helptext is None:
-        return _fire.Fire(*args, **kwargs)
-
     color = _use_color()
-    marks = {}
-    if color and display is _display_stdout:
-        # What Fire marks as bold are headings, as underlined placeholders.
-        marks = {"Bold": _heading, "Underline": _placeholder}
-        if not all(hasattr(_formatting, name) for name in marks):
-            marks = {}
-    found = {name: getattr(_formatting, name) for name in marks}
+    conventional = display is _display_stdout
+    # What Fire marks as bold are headings, as underlined placeholders.
+    marks = {"Bold": _heading, "Underline": _placeholder} if color and conventional else {}
+    originals = {name: getattr(_formatting, name) for name in marks}
 
-    helptext = _HelpText(color_usage=color, color_help=bool(marks), conventional=display is _display_stdout,
-                         remote=remote_help)
+    helptext = _HelpText(color_usage=color, color_help=bool(marks), conventional=conventional, remote=remote_help)
     _fire.core.helptext = helptext
     _fire.core.Display = display
     for name, stand_in in marks.items():
         setattr(_formatting, name, stand_in)
     try:
-        result = _fire.Fire(*args, **kwargs)
+        with _hints.typed_parsing():
+            result = _fire.Fire(*args, **kwargs)
     finally:
         _fire.core.Display = _display
         _fire.core.helptext = _helptext
-        for name, original in found.items():
+        for name, original in originals.items():
             setattr(_formatting, name, original)
 
     if helptext.incomplete is not None:

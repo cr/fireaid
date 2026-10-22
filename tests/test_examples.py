@@ -35,7 +35,7 @@ def test_tour():
     assert "pantry.py list - List the pantry" in out
     assert "Searching for 'milk' everywhere." in out
     assert "(nothing, it all went to stderr)" in out
-    assert 'The string "Added 2 x milk."' in out
+    assert "NAME\n    pantry.py add milk 2" in out
 
 
 def progress(*args, **env):

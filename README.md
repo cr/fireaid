@@ -41,8 +41,8 @@ For development:
     pip install -e .
 
 fireaid requires Fire 0.2.0 or later, the first version to accept
-`--help` without a separator. On Python 3.13 and later, Fire itself
-requires version 0.7.0.
+`--help` without a separator, and Fire 0.4.0 for `python -m fireaid`.
+On Python 3.13 and later, Fire itself requires version 0.7.0.
 
 ## Usage
 
@@ -228,8 +228,13 @@ The server listens on all of the computer's addresses unless `--bind`
 names one. Without a password, anyone who can reach the port may run the
 program's commands, which is the normal state of affairs on a network of
 one's own; the server says so once when it starts. With a password,
-clients must know it; it never crosses the network. The connection is not encrypted either way. The server serves
-one client at a time.
+clients must know it: the server authenticates them by HMAC
+challenge-response, so the password never crosses the network, and a
+recorded login does not work a second time. That is mild security. The
+connection is not encrypted or protected otherwise, so whoever can
+watch it can read the commands and their output, take over a session
+once it has started, and try passwords against a recorded login. The
+server serves one client at a time.
 
 A server on Windows, which has no pseudo-terminals, gives every command
 pipes: the command behaves as if its output were redirected, and Ctrl-C
@@ -249,8 +254,8 @@ fireaid does not take anything away from the wrapped program:
   as a member created in `__init__`, may have such a parameter. There,
   `-h` is left to Fire, which shows help with its banner on stderr.
 - With `remote=True`, `--remote` belongs to fireaid on every command
-  line, and is not listed in the help for each command. `tool help
-  server` describes it.
+  line, even one whose command only runs locally, and whose help does
+  not list it.
 
 Help for a command that does not exist is an error, as it is in
 Fire's native syntax.
@@ -267,7 +272,14 @@ creates a virtual environment in `.venv`, upgrades it to the latest
 stable Fire, and runs the test suite. The tests hold fireaid to what
 this README says, mostly by comparing it to Fire on the same command
 lines. `make test PYTHON=python3.14` selects the Python for a new
-environment, `make clean` removes it.
+environment.
+
+    make test-min
+
+runs the tests against the oldest Fire that `pyproject.toml` allows, in
+`.venv-min`. That Fire needs a Python before 3.13: `python3.12` by
+default, another with `PYTHON_MIN=python3.11`. `make clean` removes both
+environments.
 
 ## Releasing
 

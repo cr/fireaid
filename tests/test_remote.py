@@ -16,11 +16,14 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
+
+import pytest
 
 import fireaid
-import pytest
 from fireaid import remote
+from support import TESTS, unix
+from support import environment as program_environment
+from support import on_terminal as run_on_terminal
 
 try:
     import fcntl
@@ -28,23 +31,15 @@ try:
     import struct
     import termios
 except ImportError:  # Windows
-    pty = None
+    pass
 
-unix = pytest.mark.skipif(pty is None, reason="needs Unix terminals and signals")
-
-TESTS = Path(__file__).parent
 PASSWORD = "p@ss word"
 
 
 def environment(component, **variables):
-    env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "FORCE_COLOR", "CLI_REMOTE")}
-    env.update(
-        FIREAID_TEST_MODULE="fireaid",
-        FIREAID_TEST_COMPONENT=component,
-        FIREAID_TEST_REMOTE="1",
-        PAGER="cat",
-        COLUMNS="80",
-    )
+    """The test program's, remote-controlled, without a CLI_REMOTE of our own."""
+    env = program_environment("fireaid", component, FIREAID_TEST_REMOTE="1")
+    env.pop("CLI_REMOTE", None)
     env.update(variables)
     return env
 
@@ -370,15 +365,15 @@ def test_refusal(command, refused):
 
 
 def test_open_server_without_a_password_warns(tmp_path):
-    log = tmp_path / "log"
+    path = tmp_path / "log"
     process = subprocess.Popen(
         [sys.executable, "cli.py", "server", "--port", "0"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log.open("w"),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=path.open("w"),
         env=environment("INSTANCE"), cwd=TESTS,
     )
-    log = Log(log)
+    log = Log(path)
     try:
-        log.wait(lambda text: Log(log.path).warned_no_password() and Log(log.path).warned_open_network())
+        log.wait(lambda _: log.warned_no_password() and log.warned_open_network())
     finally:
         process.terminate()
         process.wait(10)
@@ -449,7 +444,7 @@ def test_debug_logs_the_whole_command_line(server):
 
 def test_server_listens_everywhere_by_default():
     """--bind narrows it; a password does not change where it listens."""
-    command = fireaid._server_command(fireaid.Remote(), "t", "T", None)[0]
+    command = fireaid._server_command(fireaid.Remote(), "t", "T", None)
     parameters = inspect.signature(command).parameters
     assert parameters["bind"].default == "0.0.0.0"
     assert parameters["password"].default is None
@@ -758,7 +753,7 @@ def test_input_and_exit_code_between_kinds(server, pipes, client):
     assert run(["tty", "--remote", s.target], "Probe", input=b"", **like) == (0, "000 -\n", ""), s.log.text
 
 
-def test_pipes_only_denied_and_password(server):
+def test_pipes_only_denied(server):
     s = server(pipes=True)
     code, out, err = run(["static", "bar", "--remote", s.target])
     assert (code, out) == (2, "") and Said.refused(err)
@@ -788,45 +783,9 @@ def test_interrupt_without_a_terminal(server, pipes):
 
 
 def on_terminal(argv, component="Probe", stdout_tty=True, keys=None, wait_for=b"", **variables):
-    """
-    Run the test program with a terminal of 80x24 as stdin and stderr,
-    and as stdout too unless stdout_tty is false: then stdout is a pipe.
-    Writes keys to the terminal once wait_for has appeared there.
-    Returns the exit code, the terminal's output and stdout's.
-    """
-    master, slave = pty.openpty()
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "cli.py", *argv],
-            stdin=slave,
-            stdout=slave if stdout_tty else subprocess.PIPE,
-            stderr=slave,
-            env=environment(component, TERM="xterm-256color", **variables),
-            cwd=TESTS,
-            # Its own terminal, as from a shell: Ctrl-C typed there reaches it.
-            start_new_session=True,
-            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),
-        )
-    finally:
-        os.close(slave)
-    output = b""
-    try:
-        while True:
-            try:
-                chunk = os.read(master, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            output += chunk
-            if keys is not None and wait_for in output:
-                os.write(master, keys)
-                keys = None
-    finally:
-        os.close(master)
-    stdout = process.stdout.read().decode() if process.stdout else ""
-    return process.wait(30), output.decode().replace("\r\n", "\n"), stdout
+    """Run the test program, remote-controlled, on a terminal; see support.on_terminal."""
+    env = environment(component, TERM="xterm-256color", **variables)
+    return run_on_terminal(argv, env, stdout_tty, keys, wait_for)
 
 
 @unix
@@ -878,10 +837,6 @@ def test_terminal_client_of_a_pipes_only_server(server):
     target = server("Probe", pipes=True).target
     assert on_terminal(["tty", "--remote", target]) == (0, "000 -\n", "")
     assert on_terminal(["color", "--remote", target]) == (0, "plain\nresult\n", "")
-    # Ctrl-C at a cooked terminal interrupts the client, which passes it on.
-    code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\x03", wait_for=b"started")
-    assert code == 128 + signal.SIGINT
-    assert output.endswith("interrupted\n")
 
 
 @unix
@@ -894,8 +849,11 @@ def test_terminal_for_stderr_and_a_pipe_for_stdout(server):
 
 
 @unix
-def test_ctrl_c(server):
-    target = server("Probe").target
+@pytest.mark.parametrize("pipes", [False, True], ids=["server", "pipes-only server"])
+def test_ctrl_c(server, pipes):
+    # A server with terminals gets Ctrl-C as a key. With a pipes-only server the client's
+    # terminal stays cooked: Ctrl-C interrupts the client, which passes it on.
+    target = server("Probe", pipes=pipes).target
     code, output, _ = on_terminal(["sleep", "--remote", target], keys=b"\x03", wait_for=b"started")
     assert code == 128 + signal.SIGINT
     assert output.endswith("interrupted\n")

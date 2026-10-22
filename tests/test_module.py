@@ -3,6 +3,7 @@ fireaid as a drop-in replacement of the fire module.
 """
 
 import importlib
+import importlib.util
 import inspect
 import os
 from importlib import metadata
@@ -11,6 +12,10 @@ import fire
 import pytest
 
 import fireaid
+
+# python -m fire, which python -m fireaid builds on, came with Fire 0.4.0.
+FIRE_MAIN = importlib.util.find_spec("fire.__main__") is not None
+needs_fire_main = pytest.mark.skipif(not FIRE_MAIN, reason="this Fire has no python -m fire")
 
 
 class Program:
@@ -144,6 +149,7 @@ def test_fire_is_left_as_found(command, capsys):
     assert fire.core.helptext is helptext
 
 
+@needs_fire_main
 def test_run_as_module(run_module):
     result = run_module("os.path join a b")
     assert result.code == 0
@@ -151,6 +157,7 @@ def test_run_as_module(run_module):
     assert result == run_module("os.path join a b", module="fire")
 
 
+@needs_fire_main
 def test_run_as_module_on_a_file(run_module):
     result = run_module("cli.py CLI foo x")
     assert result.code == 0
@@ -158,6 +165,7 @@ def test_run_as_module_on_a_file(run_module):
     assert result == run_module("cli.py CLI foo x", module="fire")
 
 
+@needs_fire_main
 def test_run_as_module_with_help(run_module):
     native = run_module("os.path join -- --help", module="fire")
     for command in ("os.path join --help", "os.path help join"):
@@ -167,10 +175,18 @@ def test_run_as_module_with_help(run_module):
         assert result.out == native.err
 
 
+@needs_fire_main
 def test_run_as_module_without_a_module(run_module):
     result = run_module("")
     assert result.code == 1
     assert result.out.startswith("usage: python -m fireaid")
+
+
+@pytest.mark.skipif(FIRE_MAIN, reason="this Fire has python -m fire")
+def test_run_as_module_needs_fire_main(run_module):
+    result = run_module("os.path join a b")
+    assert (result.code, result.out) == (1, "")
+    assert result.err == "python -m fireaid requires a Fire version with python -m fire\n"
 
 
 def test_help_command_in_native_syntax(capsys):
