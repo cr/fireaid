@@ -11,7 +11,8 @@ a command is incomplete, and colour that makes it all easy to read.
 It gives parameters the values their type hints say, where Fire takes
 every value for a Python literal, and a program that asks for it with
 `remote=True`, and only then, can run its commands on another computer.
-Everything else is Fire, unchanged.
+A flag the command does not take stops the command line before the
+command runs, not after. Everything else is Fire, unchanged.
 
 All you need is:
 
@@ -103,6 +104,36 @@ only if their hints are the same: Fire reads the two alike.
 Other hints, and parameters without one, are left to Fire, and so is
 a parameter whose parse function the program sets with
 `fire.decorators.SetParseFn` or `SetParseFns`.
+
+## Flags
+
+Fire calls a function with the flags it takes and leaves the rest for
+what the function returns, to report them only once nothing takes
+them. By then the function has run, without the misspelt flag:
+
+    def data(self, *words, set=None, force=False):
+        ...
+
+    tool data x --set 13 --forse    # Fire: data runs, set=13, force=False; then the usage error
+
+fireaid reports the same usage error, `Could not consume arg: --forse`,
+before the function runs, which it does not. That holds for a function,
+a method and a callable object, for each flag up to the next `-`, and
+for the command's own call of Fire, not one a command makes itself.
+What the function takes is what Fire makes of the flags: a parameter's
+name, a bare `--flag` and `--noflag` for a boolean, a short flag for
+the one parameter starting with its letter, and any flag at all where
+the function has `**kwargs`. A negative number is not a flag, nor
+anything after a `--`.
+
+A class is left to Fire: its flags may come after a method's name, as
+in `tool data x --verbose` for `MyTool(verbose=True).data('x')`.
+
+A flag for what a function returns, a command chained onto it, comes
+after a `-`, which ends the function's arguments:
+
+    tool make - run --fast          # make(), then run(fast=True) on its result
+    tool make run --fast            # ERROR: Could not consume arg: --fast
 
 ## Help
 
@@ -315,9 +346,11 @@ a server on Linux or macOS; the two kinds work together either way.
 
 ## Limits
 
-fireaid does not take anything away from the wrapped program. The one
-thing it does differently from Fire on purpose is the values hinted
-parameters get, as [Type hints](#type-hints) describes. Otherwise:
+fireaid does not take anything away from the wrapped program. What it
+does differently from Fire on purpose is the values hinted parameters
+get, as [Type hints](#type-hints) describes, and a flag a function does
+not take, which it refuses before the function runs, as
+[Flags](#flags) describes. Otherwise:
 
 - `help` is only help as the first word, and not if the program has
   a `help` command of its own, or is a single function.

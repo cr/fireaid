@@ -54,7 +54,6 @@ def test_command_runs_as_with_fire(run, component, command, out):
         ("CLI", "help -- --help"),
         ("CLI", "foo x -- --trace"),
         # Help flags that are not the last word.
-        ("CLI", "echo a --help b"),
         ("CLI", "foo -h x"),
         # Help flags the command takes itself, with an argument missing.
         ("CLI", "grep -h"),

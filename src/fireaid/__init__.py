@@ -42,6 +42,10 @@ On a terminal, usage text and help are coloured.
 Values are read as the parameters' type hints say, where Fire reads
 every value as a Python literal.
 
+A flag that a function does not take is a usage error before the
+function runs, where Fire reports it only after calling the function
+without it. A flag for what a function returns comes after a ``-``.
+
 ``Fire(component, remote=True)`` adds a ``server`` command and a
 ``--remote`` flag, which runs a command line on such a server. Remote
 control is off unless the program's own call of Fire turns it on so:
@@ -870,6 +874,62 @@ def _allowed_calls(allow: Sequence[str], prog: str) -> Any:
         _fire.trace.FireTrace.AddAccessedProperty = accessed
 
 
+@contextmanager
+def _flags_taken() -> Any:
+    """
+    Refuse a flag a routine does not take before the routine runs.
+
+    Fire calls a routine with the flags it takes and leaves the rest for
+    what the routine returns, to complain about them only once nothing
+    takes them: by then the routine has run, a misspelt flag ignored.
+    Here a routine, or a callable object, is not called while a flag up
+    to the next ``-`` is one it does not take: the command line ends
+    with Fire's usage error instead, as it would have after the call. A
+    flag for what a routine returns comes after a ``-``. Instantiating a
+    class is left to Fire: flags given there are mostly meant for a
+    method further along.
+
+    What a routine takes is what Fire would make of the flags: a
+    parameter's name, ``--noflag`` for a boolean, a short flag for the
+    one parameter starting with its letter, anything at all for one with
+    ``**kwargs``. Where Fire cannot make anything of them, as with an
+    ambiguous short flag, the call fails as Fire has it fail. Only the
+    command's own run is held so, not a nested call of Fire.
+    """
+    run, call = _fire.core._Fire, _fire.core._CallAndUpdateTrace
+    depth = 0  # Fire runs under way: 1 is the command's own
+
+    def _Fire(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - Fire's name
+        nonlocal depth
+        depth += 1
+        try:
+            return run(*args, **kwargs)
+        finally:
+            depth -= 1
+
+    def _CallAndUpdateTrace(component: Any, args: Any, component_trace: Any, *rest: Any, **kwargs: Any) -> Any:  # noqa: N802
+        if depth == 1 and not inspect.isclass(component):
+            fn = component.__call__ if kwargs.get("treatment", "class") == "callable" else component
+            try:
+                _, untaken, _ = _fire.core._ParseKeywordArgs(args, _fire.inspectutils.GetFullArgSpec(fn))
+            except Exception:  # the call fails the way Fire has it fail
+                untaken = []
+            flags = [arg for arg in untaken if _fire.core._IsFlag(arg)]
+            if flags:
+                error = _fire.core.FireError("Could not consume arg:" if len(flags) == 1 else "Could not consume args:",
+                                             *flags)
+                component_trace.AddError(error, args)
+                _fire.core._DisplayError(component_trace)
+                raise _fire.core.FireExit(2, component_trace)
+        return call(component, args, component_trace, *rest, **kwargs)
+
+    _fire.core._Fire, _fire.core._CallAndUpdateTrace = _Fire, _CallAndUpdateTrace
+    try:
+        yield
+    finally:
+        _fire.core._Fire, _fire.core._CallAndUpdateTrace = run, call
+
+
 def _fire_with(display: Any, *args: Any, remote_help: Any = None, enforce_allow: Any = None, **kwargs: Any) -> Any:
     """
     Call fire.Fire() with stand-ins for its display of help and its parsing.
@@ -896,7 +956,7 @@ def _fire_with(display: Any, *args: Any, remote_help: Any = None, enforce_allow:
     if color:
         sys.stdout, sys.stderr = map(_unstripped, streams)
     try:
-        with _hints.typed_parsing(), \
+        with _hints.typed_parsing(), _flags_taken(), \
                 (_allowed_calls(*enforce_allow) if enforce_allow is not None else nullcontext()):
             result = _fire.Fire(*args, **kwargs)
     finally:

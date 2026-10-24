@@ -574,9 +574,21 @@ def test_chained_command_outside_allow_does_not_run(tmp_path):
     """chain() returns a group; a command chained onto its result is refused as it runs."""
     s = Server("CLI", False, tmp_path / "log", FIREAID_TEST_ALLOW="chain")
     try:
-        code, out, err = run(["chain", "bar", "--x", "9", "--remote", s.target])
+        # bar's flag after a -, where chain() itself would refuse it.
+        code, out, err = run(["chain", "-", "bar", "--x", "9", "--remote", s.target])
         # bar would return "bar x=9"; instead the command refuses and produces nothing.
         assert (code, out, err) == (2, "", "cli.py: 'bar' is not available remotely\n")
+    finally:
+        s.stop()
+
+
+def test_flag_a_command_does_not_take_does_not_run_it_remotely(tmp_path):
+    """The command's own process refuses the flag before the command runs, as it does locally."""
+    s = Server("CLI", False, tmp_path / "log")
+    try:
+        code, out, err = run(["effect", "--wrod", "x", "--remote", s.target])
+        assert (code, out) == (2, "") and err.startswith("ERROR: Could not consume arg: --wrod\n")
+        assert (code, out, err) == run(["effect", "--wrod", "x"])
     finally:
         s.stop()
 
@@ -889,9 +901,12 @@ def test_remote_needs_a_server_command(component):
 
 
 def test_remote_off_leaves_the_flag_to_fire():
+    # A flag like any other that echo does not take, refused before echo runs.
     command = ["echo", "--remote", "x"]
-    result = run(command, FIREAID_TEST_REMOTE="")
-    assert result == run(command, FIREAID_TEST_REMOTE="", FIREAID_TEST_MODULE="fire")
+    code, out, err = run(command, FIREAID_TEST_REMOTE="")
+    fire_code, fire_out, fire_err = run(command, FIREAID_TEST_REMOTE="", FIREAID_TEST_MODULE="fire")
+    assert (code, out) == (fire_code, fire_out) == (2, "")
+    assert err.splitlines()[0] == fire_err.splitlines()[0] == "ERROR: Could not consume arg: --remote"
 
 
 def test_server_is_a_command():
